@@ -7,7 +7,7 @@ gpt2/
 env/
 venv/
 .venv/
-output/
+smear_output/
 *.pt
 *.pth
 *.bin
