@@ -4,6 +4,8 @@ from transformers import GPT2LMHeadModel
 from .smear_adapter import SmearAdapterLayer
 
 class GPT2WithSmearAdapter(nn.Module):
+    """GPT-2模型集成SMEAR适配器"""
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -17,20 +19,30 @@ class GPT2WithSmearAdapter(nn.Module):
             for param in self.gpt2.parameters():
                 param.requires_grad = False
         
-        # 创建SMEAR适配器层 - 作为旁路
+        # 创建SMEAR适配器层
         self.smear_adapters = nn.ModuleList([
             SmearAdapterLayer(
                 hidden_size=smear_config.hidden_size,
                 expert_size=smear_config.expert_size,
-                num_experts=smear_config.num_experts
+                num_experts=smear_config.num_experts,
+                routing_granularity=smear_config.routing_granularity,
+                segment_length=smear_config.segment_length,
+                routing_strategy=smear_config.routing_strategy,
+                top_k=smear_config.top_k
             ) for _ in range(len(config.adapter_layers))
         ])
         
-        # 旁路缩放因子（可学习）
+        # 旁路缩放因子
         self.adapter_alpha = nn.Parameter(torch.ones(len(config.adapter_layers)) * 0.1)
         
-        print(f"✅ 初始化GPT-2 + SMEAR旁路适配器")
-        print(f"   - 旁路适配器层: {config.adapter_layers}")
+        # 打印配置信息
+        strategy_name = "参数聚合" if smear_config.routing_strategy == "parameter_merging" else f"Top-{smear_config.top_k}稀疏激活"
+        print(f"✅ 初始化GPT-2 + SMEAR适配器")
+        print(f"   - 路由粒度: {smear_config.routing_granularity}")
+        print(f"   - 路由策略: {strategy_name}")
+        print(f"   - 适配器层: {config.adapter_layers}")
+        if smear_config.routing_granularity in ["segment", "causal_segment"]:
+            print(f"   - 分段长度: {smear_config.segment_length}")
         print(f"   - 可训练参数: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
     
     def forward(self, input_ids, attention_mask=None, labels=None):
@@ -45,16 +57,30 @@ class GPT2WithSmearAdapter(nn.Module):
         hidden_states = outputs.hidden_states
         adapter_outputs = []
         routing_info = []
+        expert_utilization = []
+        sparsity_info = []
         
         current_adapter_idx = 0
         for layer_idx, hidden_state in enumerate(hidden_states):
             if layer_idx in self.config.adapter_layers and current_adapter_idx < len(self.smear_adapters):
-                # 🎯 关键修改：旁路结构
-                # 原始GPT-2输出 + 缩放后的适配器输出
                 original_output = hidden_state
                 adapter_output, routing_weights = self.smear_adapters[current_adapter_idx](hidden_state)
                 
-                # 应用旁路连接：output = original + alpha * adapter
+                # 计算专家利用率
+                utilization = self.smear_adapters[current_adapter_idx].get_expert_utilization(routing_weights)
+                expert_utilization.append({
+                    'layer': layer_idx,
+                    'utilization': utilization
+                })
+                
+                # 计算稀疏性信息
+                # sparsity = self.smear_adapters[current_adapter_idx].get_sparsity_info(routing_weights)
+                # sparsity_info.append({
+                #     'layer': layer_idx,
+                #     'sparsity': sparsity
+                # })
+                
+                # 应用旁路连接
                 alpha = self.adapter_alpha[current_adapter_idx]
                 combined_output = original_output + alpha * adapter_output
                 
@@ -62,7 +88,10 @@ class GPT2WithSmearAdapter(nn.Module):
                 routing_info.append({
                     'layer': layer_idx,
                     'routing_weights': routing_weights,
-                    'alpha': alpha
+                    'alpha': alpha,
+                    'routing_granularity': self.config.smear_config.routing_granularity,
+                    'routing_strategy': self.config.smear_config.routing_strategy,
+                    'top_k': self.config.smear_config.top_k if self.config.smear_config.routing_strategy == "top_k_sparse" else None
                 })
                 current_adapter_idx += 1
             else:
@@ -91,5 +120,7 @@ class GPT2WithSmearAdapter(nn.Module):
             'logits': lm_logits,
             'lm_loss': lm_loss,
             'routing_info': routing_info,
+            'expert_utilization': expert_utilization,
+            'sparsity_info': sparsity_info,
             'hidden_states': adapter_outputs
         }

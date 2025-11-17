@@ -1,0 +1,33 @@
+{
+  "training_summary": {
+    "best_validation_loss": 3.1568761467933655,
+    "best_epoch": 7,
+    "test_loss": 3.126807603283205,
+    "test_perplexity": 23.46508874754975,
+    "total_training_epochs": 10,
+    "early_stop_epoch": 9,
+    "final_learning_rate": 9.523131313131314e-05,
+    "patience_used": 3
+  },
+  "model_info": {
+    "trainable_parameters": 39572790,
+    "device": "cuda"
+  },
+  "early_stop_config": {
+    "patience": 3,
+    "min_delta": 0.0001
+  },
+  "config": {
+    "dataset_name": "wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "max_length": 1024,
+    "learning_rate": 0.0001,
+    "num_epochs": 20,
+    "batch_size": 4,
+    "warmup_steps": 1000,
+    "total_steps": 100000,
+    "max_grad_norm": 1.0,
+    "weight_decay": 0.01,
+    "output_dir": "./smear_output_recommended"
+  }
+}

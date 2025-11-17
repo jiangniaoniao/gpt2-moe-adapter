@@ -5,14 +5,16 @@ from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
 import json
+import numpy as np
 
 class SmearTrainer:
-    """专门为SMEAR方法设计的训练器"""
+    """SMEAR训练器 - 修复早停机制"""
     
-    def __init__(self, model, train_loader, val_loader, config):
+    def __init__(self, model, train_loader, val_loader, test_loader, config):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.test_loader = test_loader
         self.config = config
         
         # 优化器 - 只训练Adapter参数
@@ -32,21 +34,32 @@ class SmearTrainer:
         # 训练统计
         self.train_stats = {
             'losses': [],
-            'lm_losses': [],
             'perplexities': [],
-            'routing_diversity': []  # SMEAR特有的路由多样性统计
+            'learning_rates': [],
+            'test_loss': None,
+            'test_perplexity': None,
+            'best_val_loss': float('inf'),
+            'best_epoch': -1,
+            'early_stop_epoch': None
         }
+        
+        # 早停相关变量
+        self.patience = getattr(config, 'patience', 3)  # 默认容忍3个epoch没有改善
+        self.patience_counter = 0
+        self.min_delta = getattr(config, 'min_delta', 1e-4)  # 最小改善阈值
         
         print(f"🚀 初始化SMEAR训练器")
         print(f"   - 设备: {self.device}")
         print(f"   - 可训练参数: {sum(p.numel() for p in trainable_params):,}")
+        print(f"   - 早停耐心值: {self.patience} epochs")
+        print(f"   - 最小改善阈值: {self.min_delta}")
+        if test_loader is not None:
+            print(f"   - 测试集大小: {len(test_loader.dataset)} 样本")
     
     def train_epoch(self, epoch):
-        """训练一个epoch - SMEAR专用"""
+        """训练一个epoch"""
         self.model.train()
         total_loss = 0
-        total_lm_loss = 0
-        total_routing_diversity = 0
         
         progress_bar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
         
@@ -70,84 +83,29 @@ class SmearTrainer:
             self.optimizer.step()
             self.scheduler.step()
             
-            # 统计 - SMEAR专用
+            # 只记录核心损失
             total_loss += loss.item()
             
-            lm_loss = outputs.get('lm_loss', None)
-            if lm_loss is not None:
-                total_lm_loss += lm_loss.item()
-            
-            # 计算路由多样性（SMEAR特有）
-            routing_diversity = self._compute_routing_diversity(outputs.get('routing_info', []))
-            total_routing_diversity += routing_diversity
-            
-            # 更新进度条
+            # 简化的进度条 - 只显示核心指标
+            current_lr = self.scheduler.get_last_lr()[0]
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
-                'LM Loss': f'{lm_loss.item() if lm_loss is not None else 0:.4f}',
-                'Routing Diversity': f'{routing_diversity:.4f}'
+                'LR': f'{current_lr:.2e}',
+                'Patience': f'{self.patience_counter}/{self.patience}'
             })
             
-            # 记录路由信息
-            routing_info = outputs.get('routing_info', [])
-            if batch_idx % 100 == 0 and routing_info:
-                self._log_smear_routing_info(routing_info, epoch, batch_idx)
+            # 每100个batch记录一次学习率（可选）
+            if batch_idx % 100 == 0:
+                self.train_stats['learning_rates'].append(current_lr)
         
         # 记录epoch统计
         avg_loss = total_loss / len(self.train_loader)
-        avg_lm_loss = total_lm_loss / len(self.train_loader) if total_lm_loss > 0 else 0
-        avg_routing_diversity = total_routing_diversity / len(self.train_loader)
-        
         self.train_stats['losses'].append(avg_loss)
-        self.train_stats['lm_losses'].append(avg_lm_loss)
-        self.train_stats['routing_diversity'].append(avg_routing_diversity)
         
-        return avg_loss, avg_lm_loss, avg_routing_diversity
-    
-    def _compute_routing_diversity(self, routing_info):
-        """计算SMEAR路由多样性（专家权重分布的熵）"""
-        if not routing_info:
-            return 0.0
-        
-        total_diversity = 0.0
-        count = 0
-        
-        for info in routing_info:
-            if 'routing_weights' in info:
-                routing_weights = info['routing_weights']  # [batch_size, num_experts]
-                
-                # 计算平均路由权重
-                avg_weights = torch.mean(routing_weights, dim=0)
-                
-                # 计算熵作为多样性指标
-                entropy = -torch.sum(avg_weights * torch.log(avg_weights + 1e-8))
-                total_diversity += entropy.item()
-                count += 1
-        
-        return total_diversity / count if count > 0 else 0.0
-    
-    def _log_smear_routing_info(self, routing_info, epoch, batch_idx):
-        """记录SMEAR路由信息"""
-        print(f"\n📊 Epoch {epoch}, Batch {batch_idx} - SMEAR路由信息:")
-        
-        for info in routing_info:
-            layer = info.get('layer', 'unknown')
-            
-            if 'routing_weights' in info:
-                routing_weights = info['routing_weights']
-                avg_weights = torch.mean(routing_weights, dim=0)
-                weights_str = avg_weights.cpu().detach().numpy().round(4)
-                
-                # 计算每个专家的使用强度
-                expert_strength = torch.mean(routing_weights, dim=0)
-                dominant_expert = torch.argmax(expert_strength).item()
-                
-                print(f"  层 {layer}:")
-                print(f"    - 路由权重: {weights_str}")
-                print(f"    - 主导专家: {dominant_expert} (权重: {expert_strength[dominant_expert]:.4f})")
+        return avg_loss
     
     def validate(self, epoch):
-        """验证 - SMEAR专用"""
+        """验证"""
         self.model.eval()
         total_loss = 0
         total_perplexity = 0
@@ -159,54 +117,83 @@ class SmearTrainer:
                 labels = batch['labels'].to(self.device)
                 
                 outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                total_loss += outputs['loss'].item()
+                loss = outputs['loss']
+                total_loss += loss.item()
                 
                 # 计算困惑度
-                lm_loss = outputs.get('lm_loss', None)
-                if lm_loss is not None:
-                    perplexity = torch.exp(torch.tensor(lm_loss.item()))
-                    total_perplexity += perplexity.item()
+                perplexity = torch.exp(torch.tensor(loss.item()))
+                total_perplexity += perplexity.item()
         
         avg_loss = total_loss / len(self.val_loader)
-        avg_perplexity = total_perplexity / len(self.val_loader) if total_perplexity > 0 else float('inf')
+        avg_perplexity = total_perplexity / len(self.val_loader)
         
         self.train_stats['perplexities'].append(avg_perplexity)
         
         return avg_loss, avg_perplexity
     
-    def train(self):
-        """完整训练流程"""
-        best_val_loss = float('inf')
+    def test(self, model_path=None):
+        """在测试集上评估模型"""
+        if self.test_loader is None:
+            print("⚠️  未提供测试集，跳过测试评估")
+            return None, None
         
-        print("🚀 开始训练SMEAR适配器模型")
+        # 如果指定了模型路径，则重新加载完整模型
+        if model_path is not None:
+            self.load_complete_model(model_path)
+            print(f"📂 加载完整模型进行测试: {model_path}")
         
-        for epoch in range(self.config.num_epochs):
-            print(f"\n📍 Epoch {epoch + 1}/{self.config.num_epochs}")
-            
-            # 训练
-            train_loss, train_lm_loss, train_routing_diversity = self.train_epoch(epoch)
-            
-            # 验证
-            val_loss, val_perplexity = self.validate(epoch)
-            
-            print(f"📈 SMEAR训练统计:")
-            print(f"  - 总损失: {train_loss:.4f}")
-            print(f"  - LM损失: {train_lm_loss:.4f}") 
-            print(f"  - 路由多样性: {train_routing_diversity:.4f}")
-            print(f"  - 验证损失: {val_loss:.4f}")
-            print(f"  - 验证困惑度: {val_perplexity:.4f}")
-            
-            # 保存最佳模型
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_model(f"best_smear_model_epoch_{epoch}")
-                print(f"💾 保存最佳SMEAR模型 (验证损失: {val_loss:.4f})")
-            
-            # 保存训练统计
-            self.save_training_stats()
+        self.model.eval()
+        total_loss = 0
+        total_perplexity = 0
+        
+        print("🧪 开始在测试集上评估...")
+        
+        with torch.no_grad():
+            for batch in tqdm(self.test_loader, desc='Testing'):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss']
+                total_loss += loss.item()
+                
+                # 计算困惑度
+                perplexity = torch.exp(torch.tensor(loss.item()))
+                total_perplexity += perplexity.item()
+        
+        avg_loss = total_loss / len(self.test_loader)
+        avg_perplexity = total_perplexity / len(self.test_loader)
+        
+        # 保存测试结果
+        self.train_stats['test_loss'] = avg_loss
+        self.train_stats['test_perplexity'] = avg_perplexity
+        
+        print(f"🎯 测试集结果:")
+        print(f"  - 测试损失: {avg_loss:.4f}")
+        print(f"  - 测试困惑度: {avg_perplexity:.4f}")
+        
+        return avg_loss, avg_perplexity
     
-    def save_model(self, path):
-        """保存SMEAR模型"""
+    def save_complete_model(self, path):
+        """保存完整模型（基础模型 + SMEAR适配器）"""
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        save_path = os.path.join(self.config.output_dir, path)
+        os.makedirs(save_path, exist_ok=True)
+        
+        # 保存完整模型状态
+        complete_state_dict = {
+            'model_state_dict': self.model.state_dict(),
+            'config': self.config.__dict__,
+            'training_stats': self.train_stats,
+            'smear_adapters_only': False  # 标记这是完整模型
+        }
+        
+        torch.save(complete_state_dict, os.path.join(save_path, 'complete_model.pth'))
+        print(f"💾 保存完整模型到 {save_path}")
+    
+    def save_smear_adapters_only(self, path):
+        """仅保存SMEAR适配器参数（用于继续训练）"""
         os.makedirs(self.config.output_dir, exist_ok=True)
         save_path = os.path.join(self.config.output_dir, path)
         os.makedirs(save_path, exist_ok=True)
@@ -215,26 +202,199 @@ class SmearTrainer:
         model_state_dict = self.model.state_dict()
         smear_state_dict = {
             name: param for name, param in model_state_dict.items()
-            if any(key in name for key in ['smear_adapters', 'adapters'])
+            if any(key in name for key in ['smear_adapters', 'adapter_alpha'])
         }
         
-        # 如果没有找到，保存所有可训练参数
-        if not smear_state_dict:
-            smear_state_dict = {
-                name: param for name, param in model_state_dict.items()
-                if param.requires_grad
-            }
+        adapter_only_state_dict = {
+            'smear_adapters': smear_state_dict,
+            'config': self.config.__dict__,
+            'training_stats': self.train_stats,
+            'smear_adapters_only': True  # 标记这是仅适配器
+        }
         
-        torch.save(smear_state_dict, os.path.join(save_path, 'smear_weights.pth'))
+        torch.save(adapter_only_state_dict, os.path.join(save_path, 'smear_adapters.pth'))
+        print(f"💾 保存 {len(smear_state_dict)} 个SMEAR适配器参数到 {save_path}")
+    
+    def load_complete_model(self, model_path):
+        """加载完整模型"""
+        checkpoint_path = os.path.join(model_path, 'complete_model.pth')
         
-        # 保存配置
-        with open(os.path.join(save_path, 'config.json'), 'w') as f:
-            json.dump(self.config.__dict__, f, indent=2)
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ 完整模型文件不存在: {checkpoint_path}")
+            print("⚠️  尝试加载仅适配器版本...")
+            return self.load_smear_adapters_only(model_path)
         
-        print(f"💾 保存了 {len(smear_state_dict)} 个SMEAR适配器参数")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # 加载完整模型状态
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 更新配置和训练统计（可选）
+        if 'training_stats' in checkpoint:
+            self.train_stats.update(checkpoint['training_stats'])
+        
+        print(f"📥 从 {model_path} 加载完整模型")
+        return True
+    
+    def load_smear_adapters_only(self, model_path):
+        """仅加载SMEAR适配器参数"""
+        checkpoint_path = os.path.join(model_path, 'smear_adapters.pth')
+        
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ 适配器文件不存在: {checkpoint_path}")
+            return False
+        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # 获取当前模型状态字典
+        model_state_dict = self.model.state_dict()
+        
+        # 只更新SMEAR相关的参数
+        smear_adapters = checkpoint['smear_adapters']
+        for name, param in smear_adapters.items():
+            if name in model_state_dict:
+                model_state_dict[name].copy_(param)
+            else:
+                print(f"⚠️  跳过不匹配的参数: {name}")
+        
+        # 加载更新后的状态字典
+        self.model.load_state_dict(model_state_dict)
+        
+        # 更新训练统计（可选）
+        if 'training_stats' in checkpoint:
+            self.train_stats.update(checkpoint['training_stats'])
+        
+        print(f"📥 从 {model_path} 加载SMEAR适配器参数")
+        return True
+    
+    def check_early_stop(self, current_val_loss, best_val_loss, epoch):
+        """检查是否应该早停 - 修复版本"""
+        # 检查是否有显著改善（超过最小阈值）
+        improvement = best_val_loss - current_val_loss
+        
+        if improvement > self.min_delta:
+            # 有显著改善，重置计数器
+            self.patience_counter = 0
+            print(f"✅ 验证损失改善: {improvement:.6f} > {self.min_delta}")
+            return False
+        else:
+            # 没有显著改善，增加计数器
+            self.patience_counter += 1
+            print(f"⏳ 验证损失未改善，耐心计数: {self.patience_counter}/{self.patience}")
+            
+            # 检查是否达到耐心限制
+            if self.patience_counter >= self.patience:
+                print(f"🛑 早停触发！连续 {self.patience} 个epoch验证损失未改善")
+                self.train_stats['early_stop_epoch'] = epoch
+                return True
+            
+            return False
+    
+    def train(self):
+        """完整训练流程 - 修复早停机制"""
+        best_val_loss = float('inf')
+        best_epoch = -1
+        
+        print("🚀 开始训练SMEAR适配器模型")
+        
+        for epoch in range(self.config.num_epochs):
+            print(f"\n📍 Epoch {epoch + 1}/{self.config.num_epochs}")
+            
+            # 训练
+            train_loss = self.train_epoch(epoch)
+            
+            # 验证
+            val_loss, val_perplexity = self.validate(epoch)
+            
+            # 简化的训练统计输出
+            print(f"📈 训练统计:")
+            print(f"  - 训练损失: {train_loss:.4f}")
+            print(f"  - 验证损失: {val_loss:.4f}")
+            print(f"  - 验证困惑度: {val_perplexity:.4f}")
+            
+            # 检查是否有改善
+            has_improvement = val_loss < best_val_loss - self.min_delta
+            
+            # 保存最佳模型（只在性能提升时保存）
+            if has_improvement:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                
+                # 保存完整模型用于测试
+                self.save_complete_model("best_smear_model")
+                # 同时保存适配器参数用于继续训练
+                self.save_smear_adapters_only("best_smear_adapters")
+                
+                self.train_stats['best_val_loss'] = best_val_loss
+                self.train_stats['best_epoch'] = best_epoch
+                print(f"💾 保存最佳模型 (验证损失: {val_loss:.4f}, Epoch: {epoch})")
+            else:
+                print(f"📉 验证损失未改善，跳过保存 (当前最佳: {best_val_loss:.4f})")
+            
+            # 检查早停条件 - 只在没有改善时检查
+            if not has_improvement and self.check_early_stop(val_loss, best_val_loss, epoch):
+                print(f"⏹️  训练在 Epoch {epoch} 提前停止")
+                break
+            
+            # 保存训练统计
+            self.save_training_stats()
+        
+        # 训练结束后在测试集上评估最佳模型
+        print(f"\n{'='*50}")
+        print("🎯 训练完成，开始在测试集上评估最佳模型...")
+        print(f"{'='*50}")
+        
+        test_loss, test_perplexity = self.test("best_smear_model")
+        
+        # 最终报告
+        print(f"\n{'='*50}")
+        print("🏁 最终训练报告:")
+        print(f"{'='*50}")
+        print(f"📊 最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
+        print(f"📊 最终训练轮数: {len(self.train_stats['losses'])}")
+        if self.train_stats['early_stop_epoch'] is not None:
+            print(f"⏹️  早停触发于: Epoch {self.train_stats['early_stop_epoch']}")
+        if test_loss is not None:
+            print(f"🎯 测试集损失: {test_loss:.4f}")
+            print(f"🎯 测试集困惑度: {test_perplexity:.4f}")
+        
+        # 保存最终报告
+        self.save_final_report(best_val_loss, best_epoch, test_loss, test_perplexity)
+        
+        return best_val_loss
     
     def save_training_stats(self):
-        """保存训练统计信息"""
+        """保存训练统计"""
         os.makedirs(self.config.output_dir, exist_ok=True)
         with open(os.path.join(self.config.output_dir, 'smear_training_stats.json'), 'w') as f:
             json.dump(self.train_stats, f, indent=2)
+    
+    def save_final_report(self, best_val_loss, best_epoch, test_loss, test_perplexity):
+        """保存最终训练报告"""
+        report = {
+            'training_summary': {
+                'best_validation_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'test_loss': test_loss,
+                'test_perplexity': test_perplexity,
+                'total_training_epochs': len(self.train_stats['losses']),
+                'early_stop_epoch': self.train_stats['early_stop_epoch'],
+                'final_learning_rate': self.train_stats['learning_rates'][-1] if self.train_stats['learning_rates'] else 0,
+                'patience_used': self.patience_counter
+            },
+            'model_info': {
+                'trainable_parameters': sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+                'device': str(self.device)
+            },
+            'early_stop_config': {
+                'patience': self.patience,
+                'min_delta': self.min_delta
+            },
+            'config': self.config.__dict__
+        }
+        
+        report_path = os.path.join(self.config.output_dir, 'final_training_report.json')
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f"📄 最终报告已保存到: {report_path}")
