@@ -3,15 +3,44 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import GPT2Tokenizer
 
-def get_dataloaders(config):
-    """加载数据集 - 包含训练集、验证集和测试集"""
+def get_bookcorpus_dataloaders(config):
+    """专门为BookCorpus设计的数据加载器"""
     tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     
-    # 加载数据集
-    dataset = load_dataset(config.dataset_name, config.dataset_config)
+    print("📚 加载BookCorpus数据集...")
+    
+    # 加载BookCorpus
+    # try:
+    dataset = load_dataset("bookcorpus", split="train", trust_remote_code=True)
+    print(f"✅ 成功加载BookCorpus，共 {len(dataset)} 个样本")
+    # except Exception as e:
+    #     print(f"❌ 加载BookCorpus失败: {e}")
+    #     # 回退到较小的版本
+    #     try:
+    #         dataset = load_dataset("md_gender", "bookcorpus", split="train")
+    #         print(f"✅ 使用备用BookCorpus版本，共 {len(dataset)} 个样本")
+    #     except:
+    #         raise ValueError("无法加载BookCorpus数据集")
+    
+    # 自定义分割：训练集80%，验证集10%，测试集10%
+    total_size = len(dataset)
+    train_size = int(0.8 * total_size)
+    val_size = int(0.1 * total_size)
+    test_size = total_size - train_size - val_size
+    
+    # 分割数据集
+    train_dataset = dataset.select(range(train_size))
+    val_dataset = dataset.select(range(train_size, train_size + val_size))
+    test_dataset = dataset.select(range(train_size + val_size, total_size))
+    
+    print(f"📊 数据集分割:")
+    print(f"   - 训练集: {len(train_dataset)} 样本")
+    print(f"   - 验证集: {len(val_dataset)} 样本") 
+    print(f"   - 测试集: {len(test_dataset)} 样本")
     
     def tokenize_function(examples):
+        """分词函数 - 针对BookCorpus优化"""
         # 连接文本并分词
         tokenized = tokenizer(
             examples["text"],
@@ -23,18 +52,35 @@ def get_dataloaders(config):
         return tokenized
     
     # 分词处理
-    tokenized_datasets = dataset.map(
+    print("🔤 对数据集进行分词处理...")
+    tokenized_train = train_dataset.map(
         tokenize_function,
         batched=True,
-        remove_columns=dataset["train"].column_names,
+        remove_columns=train_dataset.column_names,
+        desc="Tokenizing training set"
+    )
+    
+    tokenized_val = val_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=val_dataset.column_names,
+        desc="Tokenizing validation set"
+    )
+    
+    tokenized_test = test_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=test_dataset.column_names,
+        desc="Tokenizing test set"
     )
     
     # 为语言建模准备labels
     def group_texts(examples):
+        """将文本分组为固定长度的块"""
         concatenated = {k: sum(examples[k], []) for k in examples.keys()}
         total_length = len(concatenated[list(examples.keys())[0]])
         
-        # 我们丢弃剩余部分，但如果数据集足够大则没问题
+        # 丢弃剩余部分
         if total_length >= config.max_length:
             total_length = (total_length // config.max_length) * config.max_length
         
@@ -45,167 +91,54 @@ def get_dataloaders(config):
         result["labels"] = result["input_ids"].copy()
         return result
     
-    tokenized_datasets = tokenized_datasets.map(
+    # 应用文本分组
+    print("📦 分组文本为固定长度块...")
+    tokenized_train = tokenized_train.map(
         group_texts,
         batched=True,
-        desc="Grouping texts in chunks of 1024",
+        desc="Grouping training texts"
     )
     
-    # 创建三个数据加载器：训练集、验证集、测试集
-    train_dataset = tokenized_datasets["train"]
-    
-    # 优先使用validation作为验证集，如果没有则使用部分test集
-    if "validation" in tokenized_datasets:
-        val_dataset = tokenized_datasets["validation"]
-        test_dataset = tokenized_datasets["test"] if "test" in tokenized_datasets else None
-    else:
-        # 如果没有validation，将test集分割为验证集和测试集
-        test_split = tokenized_datasets["test"]
-        split_ratio = getattr(config, 'val_test_split_ratio', 0.5)
-        split_idx = int(len(test_split) * split_ratio)
-        
-        val_dataset = test_split.select(range(split_idx))
-        test_dataset = test_split.select(range(split_idx, len(test_split)))
-    
-    # 训练数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=lambda batch: {
-            'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in batch]),
-            'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in batch]),
-            'labels': torch.stack([torch.tensor(item['labels']) for item in batch])
-        }
-    )
-    
-    # 验证数据加载器
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        collate_fn=lambda batch: {
-            'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in batch]),
-            'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in batch]),
-            'labels': torch.stack([torch.tensor(item['labels']) for item in batch])
-        }
-    )
-    
-    # 测试数据加载器（如果测试集存在）
-    test_loader = None
-    if test_dataset is not None:
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            collate_fn=lambda batch: {
-                'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in batch]),
-                'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in batch]),
-                'labels': torch.stack([torch.tensor(item['labels']) for item in batch])
-            }
-        )
-    
-    # 打印数据集信息
-    print(f"📊 数据集信息:")
-    print(f"   - 训练集样本数: {len(train_dataset)}")
-    print(f"   - 验证集样本数: {len(val_dataset)}")
-    if test_loader:
-        print(f"   - 测试集样本数: {len(test_dataset)}")
-    else:
-        print(f"   - 测试集: 未提供")
-    
-    return train_loader, val_loader, test_loader, tokenizer
-
-def get_wikitext_dataloaders_with_custom_split(config, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
-    """可选：自定义数据集分割比例"""
-    assert train_ratio + val_ratio + test_ratio == 1.0, "分割比例之和必须为1"
-    
-    tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    # 加载数据集
-    dataset = load_dataset(config.dataset_name, config.dataset_config)
-    
-    def tokenize_function(examples):
-        tokenized = tokenizer(
-            examples["text"],
-            truncation=True,
-            padding=False,
-            max_length=config.max_length,
-            return_tensors=None
-        )
-        return tokenized
-    
-    # 分词处理
-    tokenized_datasets = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-    )
-    
-    # 为语言建模准备labels
-    def group_texts(examples):
-        concatenated = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated[list(examples.keys())[0]])
-        
-        if total_length >= config.max_length:
-            total_length = (total_length // config.max_length) * config.max_length
-        
-        result = {
-            k: [t[i : i + config.max_length] for i in range(0, total_length, config.max_length)]
-            for k, t in concatenated.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-    
-    tokenized_datasets = tokenized_datasets.map(
+    tokenized_val = tokenized_val.map(
         group_texts,
         batched=True,
-        desc="Grouping texts in chunks of 1024",
+        desc="Grouping validation texts"
     )
     
-    # 自定义分割
-    train_dataset = tokenized_datasets["train"]
-    val_dataset = tokenized_datasets["validation"]
-    test_dataset = tokenized_datasets["test"]
-
+    tokenized_test = tokenized_test.map(
+        group_texts,
+        batched=True,
+        desc="Grouping test texts"
+    )
+    
     # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=lambda batch: {
+    def collate_fn(batch):
+        return {
             'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in batch]),
             'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in batch]),
             'labels': torch.stack([torch.tensor(item['labels']) for item in batch])
         }
+    
+    train_loader = DataLoader(
+        tokenized_train,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn
     )
     
     val_loader = DataLoader(
-        val_dataset,
+        tokenized_val,
         batch_size=config.batch_size,
         shuffle=False,
-        collate_fn=lambda batch: {
-            'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in batch]),
-            'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in batch]),
-            'labels': torch.stack([torch.tensor(item['labels']) for item in batch])
-        }
+        collate_fn=collate_fn
     )
     
     test_loader = DataLoader(
-        test_dataset,
+        tokenized_test,
         batch_size=config.batch_size,
         shuffle=False,
-        collate_fn=lambda batch: {
-            'input_ids': torch.stack([torch.tensor(item['input_ids']) for item in batch]),
-            'attention_mask': torch.stack([torch.tensor(item['attention_mask']) for item in batch]),
-            'labels': torch.stack([torch.tensor(item['labels']) for item in batch])
-        }
+        collate_fn=collate_fn
     )
     
-    print(f"📊 自定义数据集分割:")
-    print(f"   - 训练集样本数: {len(train_dataset)}")
-    print(f"   - 验证集样本数: {len(val_dataset)}")
-    print(f"   - 测试集样本数: {len(test_dataset)}")
-    
+    print("✅ BookCorpus数据加载器创建完成")
     return train_loader, val_loader, test_loader, tokenizer

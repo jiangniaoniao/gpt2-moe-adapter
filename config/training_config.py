@@ -14,3 +14,5 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     output_dir: str = "./smear_output"
+    use_fp16: bool = True
+    fp16_opt_level: str = "O1"

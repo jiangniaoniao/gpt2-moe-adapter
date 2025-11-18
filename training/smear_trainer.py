@@ -6,9 +6,192 @@ from tqdm import tqdm
 import os
 import json
 import numpy as np
+from torch.cuda.amp import autocast, GradScaler
+
+class LongBenchEvaluator:
+    """LongBench评估器 - 专门测试长文本理解能力 + FP16支持"""
+    
+    def __init__(self, model, tokenizer, device, use_fp16=True):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.use_fp16 = use_fp16 and torch.cuda.is_available()
+        self.results = {}
+        
+        print(f"🧪 LongBench评估器初始化 - FP16: {'启用' if self.use_fp16 else '禁用'}")
+
+    def evaluate_single_task(self, task_name, dataset, max_samples=20):
+        """评估单个LongBench任务 - 支持FP16"""
+        print(f"🧪 评估任务: {task_name}")
+        
+        if max_samples and len(dataset) > max_samples:
+            dataset = dataset.select(range(max_samples))
+        
+        task_results = {
+            'exact_match': [],
+            'rouge_scores': [],
+            'perplexity': []
+        }
+        
+        for i, sample in enumerate(tqdm(dataset, desc=f"评估 {task_name}")):
+            try:
+                # 构建输入
+                context = sample.get('context', '')
+                question = sample.get('input', '') or sample.get('question', '')
+                ground_truth = sample.get('answers', [''])[0] if sample.get('answers') else sample.get('target', '')
+                
+                # 根据任务类型构建提示
+                if 'qa' in task_name.lower():
+                    prompt = f"基于以下文档回答问题：\n\n文档：{context}\n\n问题：{question}\n\n答案："
+                elif 'summar' in task_name.lower():
+                    prompt = f"为以下文档生成摘要：\n\n{context}\n\n摘要："
+                else:
+                    prompt = f"{context}\n\n{question}"
+                
+                # 分词
+                inputs = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=2048  # 限制输入长度
+                ).to(self.device)
+                
+                # 生成 - 支持FP16
+                with torch.no_grad():
+                    if self.use_fp16:
+                        with autocast():
+                            outputs = self.model.generate(
+                                inputs.input_ids,
+                                max_new_tokens=256,
+                                do_sample=False,
+                                pad_token_id=self.tokenizer.eos_token_id,
+                                num_return_sequences=1
+                            )
+                    else:
+                        outputs = self.model.generate(
+                            inputs.input_ids,
+                            max_new_tokens=256,
+                            do_sample=False,
+                            pad_token_id=self.tokenizer.eos_token_id,
+                            num_return_sequences=1
+                        )
+                
+                # 解码生成结果
+                generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                prediction = generated_text[len(prompt):].strip()
+                
+                # 计算精确匹配
+                exact_match = 1.0 if prediction.strip() == ground_truth.strip() else 0.0
+                task_results['exact_match'].append(exact_match)
+                
+                # 计算困惑度（如果适用）
+                if context:
+                    perplexity = self.calculate_perplexity(context)
+                    task_results['perplexity'].append(perplexity)
+                
+                # 打印前几个样本的示例
+                if i < 2:
+                    print(f"\n--- {task_name} 样本 {i} ---")
+                    print(f"输入: {prompt[:200]}...")
+                    print(f"预测: {prediction[:100]}...")
+                    print(f"真实: {ground_truth[:100]}...")
+                    print(f"精确匹配: {exact_match}")
+                    print(f"FP16: {'启用' if self.use_fp16 else '禁用'}")
+                    
+            except Exception as e:
+                print(f"❌ 评估样本 {i} 时出错: {e}")
+                continue
+        
+        # 汇总任务结果
+        if task_results['exact_match']:
+            task_summary = {
+                'exact_match': np.mean(task_results['exact_match']),
+                'samples_evaluated': len(task_results['exact_match']),
+                'fp16_enabled': self.use_fp16
+            }
+            if task_results['perplexity']:
+                task_summary['avg_perplexity'] = np.mean(task_results['perplexity'])
+            
+            self.results[task_name] = task_summary
+            return task_summary
+        else:
+            print(f"⚠️ 任务 {task_name} 无有效结果")
+            return None
+
+    def calculate_perplexity(self, text):
+        """计算文本的困惑度 - 支持FP16"""
+        try:
+            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
+            with torch.no_grad():
+                if self.use_fp16:
+                    with autocast():
+                        outputs = self.model(inputs.input_ids, labels=inputs.input_ids)
+                        loss = outputs.loss
+                else:
+                    outputs = self.model(inputs.input_ids, labels=inputs.input_ids)
+                    loss = outputs.loss
+                
+                perplexity = torch.exp(loss).item()
+            return perplexity
+        except:
+            return float('inf')
+    
+    def evaluate_all_tasks(self, max_samples_per_task=20):
+        """评估所有LongBench任务"""
+        print("🚀 开始全面LongBench评估")
+        
+        # 加载LongBench数据集
+        try:
+            longbench_tasks = {
+                'single_doc_qa': load_dataset("THUDM/LongBench", "single_doc_qa", split="test"),
+                'multi_doc_qa': load_dataset("THUDM/LongBench", "multi_doc_qa", split="test"),
+                'summarization': load_dataset("THUDM/LongBench", "summarization", split="test")
+            }
+        except Exception as e:
+            print(f"❌ 加载LongBench失败: {e}")
+            return self.results
+        
+        # 评估每个任务
+        for task_name, dataset in longbench_tasks.items():
+            if dataset is not None:
+                self.evaluate_single_task(task_name, dataset, max_samples_per_task)
+        
+        # 生成评估报告
+        self.generate_report()
+        return self.results
+    
+    def generate_report(self):
+        """生成评估报告"""
+        if not self.results:
+            print("⚠️ 无评估结果可报告")
+            return
+        
+        print("\n" + "="*60)
+        print("📊 LongBench评估报告")
+        print("="*60)
+        
+        overall_scores = []
+        for task_name, scores in self.results.items():
+            em_score = scores.get('exact_match', 0)
+            overall_scores.append(em_score)
+            print(f"📝 {task_name}:")
+            print(f"   - 精确匹配: {em_score:.4f}")
+            print(f"   - 评估样本: {scores.get('samples_evaluated', 0)}")
+            if 'avg_perplexity' in scores:
+                print(f"   - 平均困惑度: {scores['avg_perplexity']:.4f}")
+        
+        if overall_scores:
+            avg_score = np.mean(overall_scores)
+            print(f"\n🎯 总体平均精确匹配: {avg_score:.4f}")
+        
+        # 保存结果
+        import json
+        with open("longbench_evaluation_results.json", "w", encoding="utf-8") as f:
+            json.dump(self.results, f, indent=2, ensure_ascii=False)
+        print(f"💾 详细结果已保存至: longbench_evaluation_results.json")
 
 class SmearTrainer:
-    """SMEAR训练器 - 修复早停机制"""
+    """SMEAR训练器 - 修复早停机制 + FP16支持"""
     
     def __init__(self, model, train_loader, val_loader, test_loader, config):
         self.model = model
@@ -16,6 +199,10 @@ class SmearTrainer:
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.config = config
+        
+        # FP16配置
+        self.use_fp16 = getattr(config, 'use_fp16', True)  # 默认为True
+        self.scaler = GradScaler() if self.use_fp16 and torch.cuda.is_available() else None
         
         # 优化器 - 只训练Adapter参数
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -40,24 +227,25 @@ class SmearTrainer:
             'test_perplexity': None,
             'best_val_loss': float('inf'),
             'best_epoch': -1,
-            'early_stop_epoch': None
+            'early_stop_epoch': None,
+            'fp16_enabled': self.use_fp16 and self.scaler is not None  # 记录FP16状态
         }
         
         # 早停相关变量
-        self.patience = getattr(config, 'patience', 3)  # 默认容忍3个epoch没有改善
+        self.patience = getattr(config, 'patience', 3)
         self.patience_counter = 0
-        self.min_delta = getattr(config, 'min_delta', 1e-4)  # 最小改善阈值
+        self.min_delta = getattr(config, 'min_delta', 1e-4)
         
         print(f"🚀 初始化SMEAR训练器")
         print(f"   - 设备: {self.device}")
+        print(f"   - FP16: {'启用' if self.train_stats['fp16_enabled'] else '禁用'}")
         print(f"   - 可训练参数: {sum(p.numel() for p in trainable_params):,}")
         print(f"   - 早停耐心值: {self.patience} epochs")
-        print(f"   - 最小改善阈值: {self.min_delta}")
-        if test_loader is not None:
-            print(f"   - 测试集大小: {len(test_loader.dataset)} 样本")
-    
+        if self.train_stats['fp16_enabled']:
+            print(f"   - 使用混合精度训练 (FP16)")
+
     def train_epoch(self, epoch):
-        """训练一个epoch"""
+        """训练一个epoch - 支持FP16"""
         self.model.train()
         total_loss = 0
         
@@ -69,32 +257,53 @@ class SmearTrainer:
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            # 前向传播
-            outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs['loss']
+            # FP16前向传播
+            if self.use_fp16 and self.scaler is not None:
+                with autocast():
+                    outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs['loss']
+                
+                # FP16反向传播和梯度缩放
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                
+                # 梯度裁剪（在缩放后的梯度上）
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                
+                # 优化器步骤和缩放器更新
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+            else:
+                # 普通FP32训练
+                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss']
+                
+                # 反向传播
+                self.optimizer.zero_grad()
+                loss.backward()
+                
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
             
-            # 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-            
-            self.optimizer.step()
+            # 学习率调度（两种模式都需要）
             self.scheduler.step()
             
-            # 只记录核心损失
+            # 记录损失
             total_loss += loss.item()
             
-            # 简化的进度条 - 只显示核心指标
+            # 进度条更新
             current_lr = self.scheduler.get_last_lr()[0]
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'LR': f'{current_lr:.2e}',
-                'Patience': f'{self.patience_counter}/{self.patience}'
+                'Patience': f'{self.patience_counter}/{self.patience}',
+                'FP16': 'ON' if self.use_fp16 else 'OFF'
             })
             
-            # 每100个batch记录一次学习率（可选）
+            # 定期记录学习率
             if batch_idx % 100 == 0:
                 self.train_stats['learning_rates'].append(current_lr)
         
@@ -103,9 +312,9 @@ class SmearTrainer:
         self.train_stats['losses'].append(avg_loss)
         
         return avg_loss
-    
+
     def validate(self, epoch):
-        """验证"""
+        """验证 - 支持FP16"""
         self.model.eval()
         total_loss = 0
         total_perplexity = 0
@@ -116,8 +325,15 @@ class SmearTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs['loss']
+                # 验证时也使用FP16以减少内存占用
+                if self.use_fp16:
+                    with autocast():
+                        outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = outputs['loss']
+                else:
+                    outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs['loss']
+                
                 total_loss += loss.item()
                 
                 # 计算困惑度
@@ -130,9 +346,9 @@ class SmearTrainer:
         self.train_stats['perplexities'].append(avg_perplexity)
         
         return avg_loss, avg_perplexity
-    
+
     def test(self, model_path=None):
-        """在测试集上评估模型"""
+        """在测试集上评估模型 - 支持FP16"""
         if self.test_loader is None:
             print("⚠️  未提供测试集，跳过测试评估")
             return None, None
@@ -154,8 +370,15 @@ class SmearTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs['loss']
+                # 测试时使用FP16
+                if self.use_fp16:
+                    with autocast():
+                        outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = outputs['loss']
+                else:
+                    outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = outputs['loss']
+                
                 total_loss += loss.item()
                 
                 # 计算困惑度
@@ -174,7 +397,7 @@ class SmearTrainer:
         print(f"  - 测试困惑度: {avg_perplexity:.4f}")
         
         return avg_loss, avg_perplexity
-    
+
     def save_complete_model(self, path):
         """保存完整模型（基础模型 + SMEAR适配器）"""
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -186,7 +409,8 @@ class SmearTrainer:
             'model_state_dict': self.model.state_dict(),
             'config': self.config.__dict__,
             'training_stats': self.train_stats,
-            'smear_adapters_only': False  # 标记这是完整模型
+            'smear_adapters_only': False,
+            'fp16_enabled': self.use_fp16  # 保存FP16状态
         }
         
         torch.save(complete_state_dict, os.path.join(save_path, 'complete_model.pth'))
@@ -394,6 +618,153 @@ class SmearTrainer:
         }
         
         report_path = os.path.join(self.config.output_dir, 'final_training_report.json')
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f"📄 最终报告已保存到: {report_path}")
+
+class IntegratedSmearTrainer(SmearTrainer):
+    """集成LongBench评估的SMEAR训练器"""
+    
+    def __init__(self, model, train_loader, val_loader, test_loader, config):
+        super().__init__(model, train_loader, val_loader, test_loader, config)
+        self.longbench_evaluator = None
+    
+    def setup_longbench_evaluator(self):
+        """设置LongBench评估器"""
+        self.longbench_evaluator = LongBenchEvaluator(
+            self.model, 
+            self.tokenizer,  # 需要确保tokenizer可用
+            self.device
+        )
+        print("✅ LongBench评估器已设置")
+    
+    def evaluate_on_longbench(self, max_samples_per_task=10):
+        """在LongBench上评估模型"""
+        if self.longbench_evaluator is None:
+            self.setup_longbench_evaluator()
+        
+        print("\n" + "="*50)
+        print("🧪 开始在LongBench上评估模型...")
+        print("="*50)
+        
+        results = self.longbench_evaluator.evaluate_all_tasks(max_samples_per_task)
+        
+        # 将LongBench结果集成到训练统计中
+        if 'longbench_results' not in self.train_stats:
+            self.train_stats['longbench_results'] = {}
+        
+        self.train_stats['longbench_results'][f'epoch_{len(self.train_stats["losses"])}'] = results
+        
+        return results
+    
+    def train_with_longbench_eval(self, longbench_eval_interval=2):
+        """带LongBench评估的训练流程"""
+        best_val_loss = float('inf')
+        best_epoch = -1
+        
+        print("🚀 开始带LongBench评估的SMEAR训练")
+        
+        for epoch in range(self.config.num_epochs):
+            print(f"\n📍 Epoch {epoch + 1}/{self.config.num_epochs}")
+            
+            # 训练
+            train_loss = self.train_epoch(epoch)
+            
+            # 验证
+            val_loss, val_perplexity = self.validate(epoch)
+            
+            print(f"📈 训练统计:")
+            print(f"  - 训练损失: {train_loss:.4f}")
+            print(f"  - 验证损失: {val_loss:.4f}")
+            print(f"  - 验证困惑度: {val_perplexity:.4f}")
+            
+            # 定期在LongBench上评估
+            if (epoch + 1) % longbench_eval_interval == 0:
+                self.evaluate_on_longbench(max_samples_per_task=10)
+            
+            # 检查是否有改善
+            has_improvement = val_loss < best_val_loss - self.min_delta
+            
+            if has_improvement:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                
+                # 保存最佳模型
+                self.save_complete_model("best_smear_model")
+                self.save_smear_adapters_only("best_smear_adapters")
+                
+                self.train_stats['best_val_loss'] = best_val_loss
+                self.train_stats['best_epoch'] = best_epoch
+                print(f"💾 保存最佳模型 (验证损失: {val_loss:.4f}, Epoch: {epoch})")
+            else:
+                print(f"📉 验证损失未改善，跳过保存 (当前最佳: {best_val_loss:.4f})")
+            
+            # 检查早停
+            if not has_improvement and self.check_early_stop(val_loss, best_val_loss, epoch):
+                print(f"⏹️  训练在 Epoch {epoch} 提前停止")
+                break
+            
+            # 保存训练统计
+            self.save_training_stats()
+        
+        # 最终评估
+        print(f"\n{'='*50}")
+        print("🎯 训练完成，开始最终评估...")
+        print(f"{'='*50}")
+        
+        # 在BookCorpus测试集上评估
+        test_loss, test_perplexity = self.test("best_smear_model")
+        
+        # 在LongBench上最终评估
+        final_longbench_results = self.evaluate_on_longbench(max_samples_per_task=20)
+        
+        # 最终报告
+        print(f"\n{'='*50}")
+        print("🏁 最终训练报告:")
+        print(f"{'='*50}")
+        print(f"📊 最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
+        print(f"📊 最终训练轮数: {len(self.train_stats['losses'])}")
+        if test_loss is not None:
+            print(f"🎯 BookCorpus测试集:")
+            print(f"  - 测试损失: {test_loss:.4f}")
+            print(f"  - 测试困惑度: {test_perplexity:.4f}")
+        
+        if final_longbench_results:
+            print(f"🧪 LongBench评估:")
+            for task, scores in final_longbench_results.items():
+                print(f"  - {task}: 精确匹配 = {scores.get('exact_match', 0):.4f}")
+        
+        # 保存最终报告
+        self.save_final_report_with_longbench(
+            best_val_loss, best_epoch, test_loss, test_perplexity, final_longbench_results
+        )
+        
+        return best_val_loss
+    
+    def save_final_report_with_longbench(self, best_val_loss, best_epoch, test_loss, test_perplexity, longbench_results):
+        """保存包含LongBench结果的最终报告"""
+        report = {
+            'training_summary': {
+                'best_validation_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'test_loss': test_loss,
+                'test_perplexity': test_perplexity,
+                'total_training_epochs': len(self.train_stats['losses']),
+                'early_stop_epoch': self.train_stats['early_stop_epoch'],
+            },
+            'longbench_evaluation': longbench_results,
+            'model_info': {
+                'trainable_parameters': sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+                'device': str(self.device)
+            },
+            'dataset_info': {
+                'training_data': 'BookCorpus',
+                'evaluation_data': 'LongBench + BookCorpus Test Set'
+            }
+        }
+        
+        report_path = os.path.join(self.config.output_dir, 'final_training_report_with_longbench.json')
         with open(report_path, 'w') as f:
             json.dump(report, f, indent=2)
         
