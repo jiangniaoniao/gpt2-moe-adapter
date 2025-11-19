@@ -8,20 +8,11 @@ def get_bookcorpus_dataloaders(config):
     tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     
-    print("📚 加载BookCorpus数据集...")
+    print("  加载BookCorpus数据集...")
     
     # 加载BookCorpus
-    # try:
     dataset = load_dataset("bookcorpus", split="train", trust_remote_code=True)
-    print(f"✅ 成功加载BookCorpus，共 {len(dataset)} 个样本")
-    # except Exception as e:
-    #     print(f"❌ 加载BookCorpus失败: {e}")
-    #     # 回退到较小的版本
-    #     try:
-    #         dataset = load_dataset("md_gender", "bookcorpus", split="train")
-    #         print(f"✅ 使用备用BookCorpus版本，共 {len(dataset)} 个样本")
-    #     except:
-    #         raise ValueError("无法加载BookCorpus数据集")
+    print(f"  成功加载BookCorpus，共 {len(dataset)} 个样本")
     
     # 自定义分割：训练集80%，验证集10%，测试集10%
     total_size = len(dataset)
@@ -34,7 +25,7 @@ def get_bookcorpus_dataloaders(config):
     val_dataset = dataset.select(range(train_size, train_size + val_size))
     test_dataset = dataset.select(range(train_size + val_size, total_size))
     
-    print(f"📊 数据集分割:")
+    print(f"  数据集分割:")
     print(f"   - 训练集: {len(train_dataset)} 样本")
     print(f"   - 验证集: {len(val_dataset)} 样本") 
     print(f"   - 测试集: {len(test_dataset)} 样本")
@@ -52,7 +43,7 @@ def get_bookcorpus_dataloaders(config):
         return tokenized
     
     # 分词处理
-    print("🔤 对数据集进行分词处理...")
+    print("  对数据集进行分词处理...")
     tokenized_train = train_dataset.map(
         tokenize_function,
         batched=True,
@@ -92,7 +83,7 @@ def get_bookcorpus_dataloaders(config):
         return result
     
     # 应用文本分组
-    print("📦 分组文本为固定长度块...")
+    print("  分组文本为固定长度块...")
     tokenized_train = tokenized_train.map(
         group_texts,
         batched=True,
@@ -140,5 +131,5 @@ def get_bookcorpus_dataloaders(config):
         collate_fn=collate_fn
     )
     
-    print("✅ BookCorpus数据加载器创建完成")
+    print("  BookCorpus数据加载器创建完成")
     return train_loader, val_loader, test_loader, tokenizer

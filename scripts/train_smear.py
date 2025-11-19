@@ -70,7 +70,7 @@ def test_routing_strategies():
         trainer.train()
 
 def main():
-    """主训练函数 - 使用推荐的因果分段+Top-K稀疏配置"""
+    """主训练函数"""
     
     # SMEAR配置 - 推荐配置
     smear_config = SmearAdapterConfig(
@@ -118,10 +118,4 @@ def main():
     trainer.train()
 
 if __name__ == "__main__":
-    # 选择要运行的模式:
-    
-    # 1. 测试所有路由策略组合
-    # test_routing_strategies()
-    
-    # 2. 运行推荐配置
     main()

@@ -77,7 +77,7 @@ class SmearExpert(nn.Module):
     def forward_top_k_sparse(self, x, routing_weights, top_k=2):
         """
         Top-K稀疏激活策略：在输出空间加权求和
-        - 修复：确保每个位置严格只激活top_k个专家
+        - 确保每个位置严格只激活top_k个专家
         """
         batch_size, seq_len, hidden_size = x.shape
         
@@ -228,7 +228,7 @@ class SmearRouter(nn.Module):
             return routing_weights
 
 class CausalSegmentRouting(nn.Module):
-    """因果分段路由策略（Lory论文方法）"""
+    """因果分段路由策略（Lory）"""
     
     def __init__(self, segment_length: int = 256, num_experts: int = 8):
         super().__init__()

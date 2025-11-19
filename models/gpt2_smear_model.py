@@ -37,7 +37,7 @@ class GPT2WithSmearAdapter(nn.Module):
         
         # 打印配置信息
         strategy_name = "参数聚合" if smear_config.routing_strategy == "parameter_merging" else f"Top-{smear_config.top_k}稀疏激活"
-        print(f"✅ 初始化GPT-2 + SMEAR适配器")
+        print(f"  初始化GPT-2 + adapter")
         print(f"   - 路由粒度: {smear_config.routing_granularity}")
         print(f"   - 路由策略: {strategy_name}")
         print(f"   - 适配器层: {config.adapter_layers}")
