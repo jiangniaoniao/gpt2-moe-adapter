@@ -16,3 +16,5 @@ class TrainingConfig:
     output_dir: str = "./smear_output"
     use_fp16: bool = True
     fp16_opt_level: str = "O1"
+    patience: int = 3
+    min_delta: float = 0.001

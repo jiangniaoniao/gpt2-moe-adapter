@@ -12,3 +12,4 @@ smear_output*/
 *.pth
 *.bin
 training_stats.json
+test*

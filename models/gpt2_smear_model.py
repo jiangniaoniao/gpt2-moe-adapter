@@ -33,7 +33,7 @@ class GPT2WithSmearAdapter(nn.Module):
         ])
         
         # 旁路缩放因子
-        self.adapter_alpha = nn.Parameter(torch.ones(len(config.adapter_layers)) * 0.1)
+        #self.adapter_alpha = nn.Parameter(torch.ones(len(config.adapter_layers)) * 0.1)
         
         # 打印配置信息
         strategy_name = "参数聚合" if smear_config.routing_strategy == "parameter_merging" else f"Top-{smear_config.top_k}稀疏激活"
@@ -81,14 +81,13 @@ class GPT2WithSmearAdapter(nn.Module):
                 # })
                 
                 # 应用旁路连接
-                alpha = self.adapter_alpha[current_adapter_idx]
-                combined_output = original_output + alpha * adapter_output
+                # alpha = self.adapter_alpha[current_adapter_idx]
+                combined_output = original_output + adapter_output
                 
                 adapter_outputs.append(combined_output)
                 routing_info.append({
                     'layer': layer_idx,
                     'routing_weights': routing_weights,
-                    'alpha': alpha,
                     'routing_granularity': self.config.smear_config.routing_granularity,
                     'routing_strategy': self.config.smear_config.routing_strategy,
                     'top_k': self.config.smear_config.top_k if self.config.smear_config.routing_strategy == "top_k_sparse" else None
@@ -124,3 +123,15 @@ class GPT2WithSmearAdapter(nn.Module):
             'sparsity_info': sparsity_info,
             'hidden_states': adapter_outputs
         }
+    
+    def generate(self, input_ids, **kwargs):
+        """生成文本 - 委托给底层的GPT-2模型"""
+        # 确保模型处于评估模式
+        self.eval()
+        
+        # 使用GPT-2的generate方法
+        return self.gpt2.generate(input_ids, **kwargs)
+    
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        """为生成准备输入 - 委托给GPT-2模型"""
+        return self.gpt2.prepare_inputs_for_generation(input_ids, **kwargs)

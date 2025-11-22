@@ -6,7 +6,7 @@ from config.base_config import GPT2SmearConfig, SmearAdapterConfig
 from config.training_config import TrainingConfig
 from models.gpt2_smear_model import GPT2WithSmearAdapter
 from training.smear_trainer import SmearTrainer, IntegratedSmearTrainer
-from training.data_loader import get_bookcorpus_dataloaders
+from training.data_loader import get_dataloaders
 
 def test_routing_strategies():
     """测试不同的路由策略组合"""
@@ -61,7 +61,7 @@ def test_routing_strategies():
         model = GPT2WithSmearAdapter(model_config)
         
         # 数据加载器
-        train_loader, val_loader, _ = get_bookcorpus_dataloaders(training_config)
+        train_loader, val_loader, _ = get_dataloaders(training_config)
         
         # 训练器
         trainer = SmearTrainer(model, train_loader, val_loader, training_config)
@@ -72,7 +72,7 @@ def test_routing_strategies():
 def main():
     """主训练函数"""
     
-    # SMEAR配置 - 推荐配置
+    # SMEAR配置
     smear_config = SmearAdapterConfig(
         num_experts=8,
         expert_size=512,
@@ -98,18 +98,20 @@ def main():
         dataset_config="wikitext-2-raw-v1",
         max_length=1024,
         learning_rate=1e-4,
-        num_epochs=20,
-        batch_size=4,
+        num_epochs=0,
+        batch_size=16,
         output_dir="./smear_output_recommended",
         use_fp16=True,
-        fp16_opt_level="O1"
+        fp16_opt_level="O1",
+        patience=3,
+        min_delta=0.001,
     )
     
     # 创建模型
     model = GPT2WithSmearAdapter(model_config)
     
     # 数据加载器
-    train_loader, val_loader, test_loader,_ = get_bookcorpus_dataloaders(training_config)
+    train_loader, val_loader, test_loader, _ = get_dataloaders(training_config)
     
     # 训练器
     trainer = IntegratedSmearTrainer(model, train_loader, val_loader, test_loader, training_config)

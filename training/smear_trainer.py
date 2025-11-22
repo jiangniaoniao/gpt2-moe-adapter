@@ -7,6 +7,7 @@ import os
 import json
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
+from datasets import load_dataset
 
 class LongBenchEvaluator:
     """LongBench评估器 - 专门测试长文本理解能力 + FP16支持"""
@@ -40,11 +41,11 @@ class LongBenchEvaluator:
                 question = sample.get('input', '') or sample.get('question', '')
                 ground_truth = sample.get('answers', [''])[0] if sample.get('answers') else sample.get('target', '')
                 
-                # 根据任务类型构建提示
-                if 'qa' in task_name.lower():
-                    prompt = f"基于以下文档回答问题：\n\n文档：{context}\n\n问题：{question}\n\n答案："
-                elif 'summar' in task_name.lower():
-                    prompt = f"为以下文档生成摘要：\n\n{context}\n\n摘要："
+                # 根据任务类型构建提示 - 使用英文以匹配GPT-2预训练
+                if 'qa' in task_name.lower() or 'hotpotqa' in task_name.lower() or 'narrativeqa' in task_name.lower():
+                    prompt = f"Based on the following document, answer the question:\n\nDocument: {context}\n\nQuestion: {question}\n\nAnswer:"
+                elif 'summar' in task_name.lower() or 'samsum' in task_name.lower():
+                    prompt = f"Summarize the following document:\n\n{context}\n\nSummary:"
                 else:
                     prompt = f"{context}\n\n{question}"
                 
@@ -53,7 +54,7 @@ class LongBenchEvaluator:
                     prompt,
                     return_tensors="pt",
                     truncation=True,
-                    max_length=2048  # 限制输入长度
+                    max_length=1024  # 限制输入长度
                 ).to(self.device)
                 
                 # 生成 - 支持FP16
@@ -143,9 +144,9 @@ class LongBenchEvaluator:
         # 加载LongBench数据集
         try:
             longbench_tasks = {
-                'single_doc_qa': load_dataset("THUDM/LongBench", "single_doc_qa", split="test"),
-                'multi_doc_qa': load_dataset("THUDM/LongBench", "multi_doc_qa", split="test"),
-                'summarization': load_dataset("THUDM/LongBench", "summarization", split="test")
+                'narrativeqa': load_dataset("THUDM/LongBench", "narrativeqa", split="test", trust_remote_code=True),
+                'hotpotqa': load_dataset("THUDM/LongBench", "hotpotqa", split="test", trust_remote_code=True),
+                'samsum': load_dataset("THUDM/LongBench", "samsum", split="test", trust_remote_code=True)
             }
         except Exception as e:
             print(f"  加载LongBench失败: {e}")
@@ -582,10 +583,46 @@ class SmearTrainer:
             print(f"  测试集损失: {test_loss:.4f}")
             print(f"  测试集困惑度: {test_perplexity:.4f}")
         
+        # LongBench评估 - 在测试完成后进行
+        print(f"\n{'='*50}")
+        print("  开始LongBench长文本理解评估...")
+        print(f"{'='*50}")
+        self.run_longbench_evaluation()
+        
         # 保存最终报告
         self.save_final_report(best_val_loss, best_epoch, test_loss, test_perplexity)
         
         return best_val_loss
+    
+    def run_longbench_evaluation(self):
+        """运行LongBench评估"""
+        try:
+            # 创建tokenizer
+            from transformers import GPT2Tokenizer
+            tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
+            tokenizer.pad_token = tokenizer.eos_token
+            
+            # 初始化LongBench评估器
+            evaluator = LongBenchEvaluator(
+                self.model, 
+                tokenizer,
+                self.device,
+                use_fp16=self.use_fp16
+            )
+            
+            # 运行评估（限制样本数量以节省时间）
+            results = evaluator.evaluate_all_tasks(max_samples_per_task=5)
+            
+            print(f"  LongBench评估完成")
+            if results:
+                print(f"  详细结果已保存至: longbench_evaluation_results.json")
+            else:
+                print(f"  LongBench评估无结果")
+                
+        except Exception as e:
+            print(f"  LongBench评估失败: {e}")
+            print(f"  这可能是由于网络问题或依赖包缺失")
+            print(f"  跳过LongBench评估，继续其他流程...")
     
     def save_training_stats(self):
         """保存训练统计"""
@@ -632,10 +669,16 @@ class IntegratedSmearTrainer(SmearTrainer):
     
     def setup_longbench_evaluator(self):
         """设置LongBench评估器"""
+        # 创建tokenizer
+        from transformers import GPT2Tokenizer
+        tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+        
         self.longbench_evaluator = LongBenchEvaluator(
             self.model, 
-            self.tokenizer,  # 需要确保tokenizer可用
-            self.device
+            tokenizer,
+            self.device,
+            use_fp16=self.use_fp16
         )
         print("  LongBench评估器已设置")
     
