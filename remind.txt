@@ -1,1 +1,7 @@
 export HF_ENDPOINT=https://hf-mirror.com
+
+lm_eval --model hf \
+    --model_args pretrained=../gpt2 \
+    --tasks mmlu\
+    --batch_size auto \
+    --output_path ../output/gpt
