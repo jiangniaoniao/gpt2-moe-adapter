@@ -5,7 +5,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from config.base_config import GPT2SmearConfig, SmearAdapterConfig
 from config.training_config import TrainingConfig
 from models.gpt2_smear_model import GPT2WithSmearAdapter
-from training.smear_trainer import SmearTrainer, IntegratedSmearTrainer
+from training.smear_trainer import SmearTrainer
 from training.data_loader import get_dataloaders
 
 def test_routing_strategies():
@@ -74,20 +74,20 @@ def main():
     
     # SMEAR配置
     smear_config = SmearAdapterConfig(
-        num_experts=8,
+        num_experts=4,
         expert_size=512,
         router_temperature=1.0,
-        routing_granularity="causal_segment",  # 因果分段路由
+        routing_granularity="token",
         segment_length=256,
-        routing_strategy="top_k_sparse",       # Top-K稀疏激活
-        top_k=2                                # Top-2
+        routing_strategy="top_k_sparse",
+        top_k=2
     )
     
     # 模型配置
     model_config = GPT2SmearConfig(
         base_model="gpt2",
-        num_adapter_layers=6,
-        adapter_layers=[2, 4, 6, 8, 10, 12],
+        num_adapter_layers=5,
+        adapter_layers=[2, 4, 6, 8, 10],
         freeze_base_model=True,
         smear_config=smear_config
     )
@@ -98,9 +98,9 @@ def main():
         dataset_config="wikitext-2-raw-v1",
         max_length=1024,
         learning_rate=1e-4,
-        num_epochs=0,
-        batch_size=16,
-        output_dir="./smear_output_recommended",
+        num_epochs=200,
+        batch_size=4,
+        output_dir="./",
         use_fp16=True,
         fp16_opt_level="O1",
         patience=3,
@@ -114,7 +114,7 @@ def main():
     train_loader, val_loader, test_loader, _ = get_dataloaders(training_config)
     
     # 训练器
-    trainer = IntegratedSmearTrainer(model, train_loader, val_loader, test_loader, training_config)
+    trainer = SmearTrainer(model, train_loader, val_loader, test_loader, training_config)
     
     # 开始训练
     trainer.train()

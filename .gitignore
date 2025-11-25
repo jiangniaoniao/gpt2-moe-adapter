@@ -7,9 +7,13 @@ gpt2/
 env/
 venv/
 .venv/
-smear_output*/
+output*
 *.pt
 *.pth
 *.bin
 training_stats.json
 test*
+best*
+*.json
+lm-evaluation-harness/
+huggingface_model/
