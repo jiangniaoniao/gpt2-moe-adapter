@@ -1,7 +1,7 @@
 export HF_ENDPOINT=https://hf-mirror.com
 
 lm_eval --model hf \
-    --model_args pretrained=../gpt2 \
+    --model_args pretrained=../final_merged_model \
     --tasks mmlu\
     --batch_size auto \
-    --output_path ../output/gpt
+    --output_path ../output/lora

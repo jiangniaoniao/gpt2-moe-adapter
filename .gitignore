@@ -16,4 +16,5 @@ test*
 best*
 *.json
 lm-evaluation-harness/
-huggingface_model/
+final_merged_model/
+final_lora_model/

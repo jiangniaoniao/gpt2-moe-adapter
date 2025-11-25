@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class TrainingConfig:
@@ -18,3 +18,24 @@ class TrainingConfig:
     fp16_opt_level: str = "O1"
     patience: int = 3
     min_delta: float = 0.001
+    dataset_mode: str= "mixed"
+    target_total_samples = 50000 
+    dataset_mix: list[tuple[str, str, float, str]] = field(
+        default_factory=lambda: [
+            # 基础指令数据
+            ("tatsu-lab/alpaca", None, 0.3, "instruction"),
+            ("databricks/databricks-dolly-15k", None, 0.1, "instruction"),
+            
+            # 学科知识数据  
+            ("cais/mmlu", "all", 0.15, "knowledge"),
+            ("allenai/ai2_arc", "ARC-Challenge", 0.15, "knowledge"),
+            ("derek-thomas/ScienceQA", None, 0.1, "knowledge"),
+            
+            # 推理数据
+            ("gsm8k", "main", 0.1, "reasoning"),
+            ("tau/commonsense_qa", None, 0.1, "reasoning"),
+            
+            # WikiText基础语言建模
+            ("wikitext", "wikitext-2-raw-v1", 0.1, "lm")
+        ]
+    )

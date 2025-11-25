@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, GPT2Config, GPT2Tokenizer
 from tqdm import tqdm
 import os
 import json
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
+from datetime import datetime
 
 class LoRATrainer:
     """GPT-2 + LoRA微调训练器"""
@@ -226,13 +227,13 @@ class LoRATrainer:
         
         return avg_loss, avg_perplexity
 
-    def save_model(self, path, save_full_model=False):
-        """保存LoRA模型和完整模型"""
+    def save_lora_model(self, path):
+        """保存LoRA模型参数（不包含基础模型）"""
         os.makedirs(self.config.output_dir, exist_ok=True)
         save_path = os.path.join(self.config.output_dir, path)
         os.makedirs(save_path, exist_ok=True)
         
-        # 保存LoRA参数（原有的功能）
+        # 只保存LoRA参数
         model_state_dict = self.model.state_dict()
         lora_state_dict = {
             name: param for name, param in model_state_dict.items()
@@ -252,73 +253,126 @@ class LoRATrainer:
         total_lora_params = sum(p.numel() for p in lora_state_dict.values())
         print(f"  - LoRA参数量: {total_lora_params:,}")
         
-        # 保存完整模型供lm-evaluation-harness使用
-        if save_full_model:
-            full_model_path = os.path.join(save_path, 'full_model_for_eval')
-            os.makedirs(full_model_path, exist_ok=True)
-            
-            # 保存完整模型状态
-            full_checkpoint = {
-                'model_state_dict': self.model.state_dict(),
-                'config': self.config.__dict__,
-                'training_stats': self.train_stats,
-                'fp16_enabled': self.use_fp16
-            }
-            
-            torch.save(full_checkpoint, os.path.join(full_model_path, 'pytorch_model.bin'))
-            
-            # 保存模型配置
-            # if hasattr(self.model, 'config'):
-            #     self.model.config.save_pretrained(full_model_path)
-            
-            print(f"  保存完整模型到 {full_model_path}")
-            print(f"  - 完整模型参数数量: {len(model_state_dict)}")
-            total_full_params = sum(p.numel() for p in model_state_dict.values())
-            print(f"  - 完整模型参数量: {total_full_params:,}")
-    
-    def save_model_for_huggingface(self, path):
-        """保存为Hugging Face格式，供lm-evaluation-harness直接使用"""
+        return save_path
+
+    def save_merged_model(self, path="merged_model"):
+        """保存合并LoRA权重后的完整模型，供lm-evaluation使用"""
         os.makedirs(self.config.output_dir, exist_ok=True)
         save_path = os.path.join(self.config.output_dir, path)
         os.makedirs(save_path, exist_ok=True)
         
-        print(f"  保存Hugging Face格式模型到 {save_path}")
+        print("开始合并LoRA权重并保存完整模型...")
+        
+        # 确保模型在eval模式
+        self.model.eval()
+        
+        # 如果模型有合并方法，使用它
+        if hasattr(self.model, 'merge_lora'):
+            print("使用模型内置LoRA合并方法...")
+            self.model.merge_lora()
+        elif hasattr(self.model, 'merge_adapter'):
+            print("使用adapter合并方法...")
+            self.model.merge_adapter()
+        else:
+            print("⚠ 模型没有内置合并方法，直接保存当前状态...")
+        
+        # 获取模型状态字典
+        model_state_dict = self.model.state_dict()
+        
+        # 修复权重名称：移除 'gpt2.' 前缀
+        fixed_state_dict = {}
+        for key, value in model_state_dict.items():
+            if key.startswith('gpt2.'):
+                # 移除 'gpt2.' 前缀
+                new_key = key[5:]
+            else:
+                new_key = key
+            fixed_state_dict[new_key] = value
+        
+        print(f"权重名称修复完成: {len(model_state_dict)} -> {len(fixed_state_dict)}")
+        
+        # 保存修复后的权重
+        torch.save(fixed_state_dict, os.path.join(save_path, 'pytorch_model.bin'))
+        
+        # 保存标准配置
+        if hasattr(self.model, 'config'):
+            config = self.model.config
+            if hasattr(config, 'to_dict'):
+                config_dict = config.to_dict()
+            else:
+                config_dict = vars(config)
+        else:
+            # 创建默认GPT-2配置
+            config_dict = {}
+        
+        # 确保使用标准GPT2Config
+        standard_config = GPT2Config(**config_dict)
+        standard_config.save_pretrained(save_path)
+        
+        # 保存tokenizer
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
+            tokenizer.save_pretrained(save_path)
+            print("✓ Tokenizer保存成功")
+        except Exception as e:
+            print(f"⚠ Tokenizer保存失败: {e}")
+        
+        # 生成使用说明
+        self._generate_usage_instructions(save_path)
+        
+        print(f"✅ 合并后的完整模型已保存到: {save_path}")
+        print(f"  可用于lm-evaluation-harness测试的命令:")
+        print(f"  lm_eval --model hf --model_args pretrained={save_path} --tasks [task_name]")
+        
+        return save_path
+
+    def _generate_usage_instructions(self, model_path):
+        """生成使用说明文件"""
+        instructions = {
+            "model_type": "gpt2",
+            "training_method": "LoRA fine-tuning",
+            "usage": {
+                "lm_evaluation_harness": f"lm_eval --model hf --model_args pretrained={model_path} --tasks [task_name]",
+                "transformers": "from transformers import GPT2LMHeadModel, GPT2Tokenizer\nmodel = GPT2LMHeadModel.from_pretrained('path/to/model')\ntokenizer = GPT2Tokenizer.from_pretrained('path/to/model')",
+                "example_tasks": ["hellaswag", "winogrande", "piqa", "lambada", "mmlu"]
+            },
+            "note": "This model includes base GPT-2 weights merged with LoRA adapter weights"
+        }
+        
+        import json
+        with open(os.path.join(model_path, 'usage_instructions.json'), 'w') as f:
+            json.dump(instructions, f, indent=2)
+
+    def validate_model_loading(self, model_path):
+        """验证保存的模型是否能正确加载"""
+        from transformers import GPT2LMHeadModel, GPT2Tokenizer
+        
+        print(f"验证模型加载: {model_path}")
         
         try:
-            # 如果模型有save_pretrained方法，直接使用
-            if hasattr(self.model, 'save_pretrained'):
-                self.model.save_pretrained(save_path)
-                print(f"  ✓ 使用save_pretrained保存模型")
-            else:
-                # 手动保存模型状态和配置
-                torch.save(self.model.state_dict(), os.path.join(save_path, 'pytorch_model.bin'))
-                
-                # 保存配置
-                if hasattr(self.model, 'config'):
-                    import json
-                    with open(os.path.join(save_path, 'config.json'), 'w') as f:
-                        json.dump(self.model.config.to_dict(), f, indent=2)
-                
-                print(f"  ✓ 手动保存模型状态和配置")
+            # 尝试加载模型
+            model = GPT2LMHeadModel.from_pretrained(model_path)
+            tokenizer = GPT2Tokenizer.from_pretrained(model_path)
             
-            # 保存tokenizer（如果需要）
-            try:
-                from transformers import GPT2Tokenizer
-                tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
-                tokenizer.save_pretrained(save_path)
-                print(f"  ✓ 保存tokenizer")
-            except Exception as e:
-                print(f"  ⚠ 保存tokenizer失败: {e}")
+            # 检查模型参数
+            total_params = sum(p.numel() for p in model.parameters())
+            print(f"✅ 模型加载成功")
+            print(f"   - 总参数量: {total_params:,}")
+            print(f"   - 模型类型: {type(model)}")
             
-            print(f"  ✅ Hugging Face格式模型保存完成")
-            print(f"  模型路径: {save_path}")
-            print(f"  可用于lm-evaluation-harness测试的命令:")
-            print(f"  lm_eval --model hf --model_args pretrained={save_path} --tasks [task_name]")
+            # 简单推理测试
+            inputs = tokenizer("Hello, how are you?", return_tensors="pt")
+            with torch.no_grad():
+                outputs = model(**inputs)
+                logits = outputs.logits
+                
+            print(f"   - 输出形状: {logits.shape}")
+            print(f"   - 推理测试: ✓ 通过")
             
             return True
             
         except Exception as e:
-            print(f"  ❌ 保存Hugging Face格式模型失败: {e}")
+            print(f"❌ 模型加载失败: {e}")
             return False
 
     def load_model(self, model_path):
@@ -375,7 +429,7 @@ class LoRATrainer:
             return False
 
     def train(self):
-        """完整训练流程"""
+        """完整训练流程 - 只负责训练和保存模型，不进行外部评估"""
         best_val_loss = float('inf')
         best_epoch = -1
         
@@ -404,12 +458,12 @@ class LoRATrainer:
                 best_val_loss = val_loss
                 best_epoch = epoch
                 
-                # 保存最佳LoRA模型和完整模型
-                self.save_model("best_lora_model", save_full_model=True)
+                # 保存最佳LoRA模型
+                self.save_lora_model("best_lora_model")
                 
                 self.train_stats['best_val_loss'] = best_val_loss
                 self.train_stats['best_epoch'] = best_epoch
-                print(f"  保存最佳模型 (验证损失: {val_loss:.4f}, Epoch: {epoch})")
+                print(f"  保存最佳LoRA模型 (验证损失: {val_loss:.4f}, Epoch: {epoch})")
             else:
                 print(f"  验证损失未改善，跳过保存 (当前最佳: {best_val_loss:.4f})")
             
@@ -421,10 +475,6 @@ class LoRATrainer:
             # 保存训练统计
             self.save_training_stats()
         
-        # 训练结束后保存最终完整模型
-        print(f"\n  保存最终完整模型供评估使用...")
-        self.save_model("final_lora_model", save_full_model=True)
-        
         # 训练结束后在测试集上评估最佳模型
         print(f"\n{'='*50}")
         print("  训练完成，开始在测试集上评估最佳模型...")
@@ -432,11 +482,19 @@ class LoRATrainer:
         
         test_loss, test_perplexity = self.test("best_lora_model")
         
-        # 基础功能测试
-        # print(f"\n{'='*50}")
-        # print("  开始模型基础功能测试...")
-        # print(f"{'='*50}")
-        # self.run_basic_generation_test()
+        # 保存合并后的完整模型供外部评估使用
+        print(f"\n{'='*50}")
+        print("  保存合并LoRA权重后的完整模型...")
+        print(f"{'='*50}")
+        
+        merged_model_path = self.save_merged_model("final_merged_model")
+        
+        # 验证合并后的模型
+        print(f"\n验证合并后的模型...")
+        if self.validate_model_loading(merged_model_path):
+            print("✅ 模型验证通过，可以用于lm-evaluation-harness评估")
+        else:
+            print("⚠ 模型验证失败，请检查保存的模型")
         
         # 最终报告
         print(f"\n{'='*50}")
@@ -450,95 +508,27 @@ class LoRATrainer:
             print(f"  测试集损失: {test_loss:.4f}")
             print(f"  测试集困惑度: {test_perplexity:.4f}")
         
-        self.save_model_for_huggingface("huggingface_model")
+        print(f"\n{'='*50}")
+        print("  后续评估说明:")
+        print(f"{'='*50}")
+        print(f"  1. LoRA模型已保存到: {os.path.join(self.config.output_dir, 'best_lora_model')}")
+        print(f"  2. 合并后的完整模型已保存到: {merged_model_path}")
+        print(f"  3. 使用以下命令进行lm-evaluation评估:")
+        print(f"     lm_eval --model hf --model_args pretrained={merged_model_path} --tasks [task_name]")
+        print(f"  4. 示例任务: hellaswag, winogrande, piqa, mmlu, lambada")
         
         # 保存最终报告
-        self.save_final_report(best_val_loss, best_epoch, test_loss, test_perplexity)
+        self.save_final_report(best_val_loss, best_epoch, test_loss, test_perplexity, merged_model_path)
         
         return best_val_loss
 
-    def run_basic_generation_test(self):
-        """运行模型基础功能测试"""
-        try:
-            print("  正在测试模型基础生成功能...")
-            
-            # 创建tokenizer
-            from transformers import GPT2Tokenizer
-            tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
-            tokenizer.pad_token = tokenizer.eos_token
-            
-            # 测试用例
-            test_prompts = [
-                "The future of artificial intelligence is",
-                "In a world where technology advances rapidly,",
-                "Machine learning has revolutionized"
-            ]
-            
-            self.model.eval()
-            
-            print(f"  设备: {self.device}")
-            print(f"  FP16: {'启用' if self.use_fp16 else '禁用'}")
-            
-            with torch.no_grad():
-                for i, prompt in enumerate(test_prompts):
-                    print(f"\n  --- 测试样本 {i+1} ---")
-                    print(f"  输入提示: {prompt}")
-                    
-                    try:
-                        # 分词
-                        inputs = tokenizer(
-                            prompt,
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=128
-                        ).to(self.device)
-                        
-                        print(f"  输入长度: {inputs.input_ids.shape[1]} tokens")
-                        
-                        # 生成文本
-                        if self.use_fp16:
-                            with autocast():
-                                outputs = self.model.generate(
-                                    inputs.input_ids,
-                                    max_new_tokens=50,
-                                    do_sample=False,
-                                    pad_token_id=tokenizer.eos_token_id,
-                                    num_return_sequences=1
-                                )
-                        else:
-                            outputs = self.model.generate(
-                                inputs.input_ids,
-                                max_new_tokens=50,
-                                do_sample=False,
-                                pad_token_id=tokenizer.eos_token_id,
-                                num_return_sequences=1
-                            )
-                        
-                        # 解码结果
-                        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                        prediction = generated_text[len(prompt):].strip()
-                        
-                        print(f"  生成结果: {prediction}")
-                        print(f"  生成状态: ✓ 成功")
-                        
-                    except Exception as e:
-                        print(f"  生成状态: ✗ 失败 - {e}")
-                        return False
-            
-            print(f"\n  ✅ 基础功能测试完成 - 所有测试通过")
-            return True
-            
-        except Exception as e:
-            print(f"  ❌ 基础功能测试失败: {e}")
-            return False
-    
     def save_training_stats(self):
         """保存训练统计"""
         os.makedirs(self.config.output_dir, exist_ok=True)
         with open(os.path.join(self.config.output_dir, 'finetune_training_stats.json'), 'w') as f:
             json.dump(self.train_stats, f, indent=2)
     
-    def save_final_report(self, best_val_loss, best_epoch, test_loss, test_perplexity):
+    def save_final_report(self, best_val_loss, best_epoch, test_loss, test_perplexity, merged_model_path):
         """保存最终LoRA训练报告"""
         # 从模型获取LoRA配置
         lora_config = getattr(self.model, 'config', None)
@@ -557,12 +547,18 @@ class LoRATrainer:
             'model_info': {
                 'trainable_parameters': sum(p.numel() for p in self.model.parameters() if p.requires_grad),
                 'total_parameters': sum(p.numel() for p in self.model.parameters()),
-                'device': str(self.device)
+                'device': str(self.device),
+                'merged_model_path': merged_model_path
             },
             'lora_config': {
                 'rank': getattr(lora_config, 'adapter_rank', None),
                 'alpha': getattr(lora_config, 'adapter_alpha', None),
                 'base_model': getattr(lora_config, 'base_model', None)
+            },
+            'evaluation_instructions': {
+                'lm_eval_command': f"lm_eval --model hf --model_args pretrained={merged_model_path} --tasks [task_name]",
+                'suggested_tasks': ["hellaswag", "winogrande", "piqa", "mmlu"],
+                'note': "Run lm-evaluation-harness separately after training completes"
             },
             'early_stop_config': {
                 'patience': self.patience,
