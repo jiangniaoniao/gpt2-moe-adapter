@@ -12,16 +12,17 @@ import os
 import numpy as np
 from training.data_loader import get_dataloaders
 from tqdm.auto import tqdm  # 添加tqdm
+from torch.cuda.amp import autocast, GradScaler  # 添加AMP支持
 
 @dataclass
 class LoRAConfig:
     """LoRA微调配置"""
     base_model: str = "/home/yang/gpt2-moe-adapter/gpt2"
     dataset_mode: str = "mixed"  # 'mixed' 或 'single'
-    batch_size: int = 4
-    max_length: int = 512
+    batch_size: int = 16
+    max_length: int = 1024
     learning_rate: float = 5e-4
-    num_epochs: int = 3
+    num_epochs: int = 50
     warmup_steps: int = 500
     logging_steps: int = 100
     eval_steps: int = 500
@@ -36,6 +37,10 @@ class LoRAConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.1
     lora_target_modules: tuple = ("c_attn", "c_proj")  # GPT-2的注意力投影层
+    
+    # FP16配置
+    use_fp16: bool = True  # 启用混合精度训练
+    fp16_opt_level: str = "O1"  # 优化级别: O0, O1, O2, O3
     
     # 数据集混合配置
     dataset_mix: list = field(
@@ -177,8 +182,8 @@ def train_lora_gpt2(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
-    # 加载数据 - 注意：这里直接使用数据加载器，不需要额外的collate_fn
-    print("📊 加载数据集...")
+    # 加载数据
+    print("  加载数据集...")
     train_loader, val_loader, test_loader, tokenizer = get_dataloaders(config)
     
     # 设置模型
@@ -210,14 +215,13 @@ def train_lora_gpt2(config):
         greater_is_better=False,
         learning_rate=config.learning_rate,
         weight_decay=0.01,
-        fp16=torch.cuda.is_available(),
+        fp16=config.use_fp16 and torch.cuda.is_available(),  # 根据配置启用fp16
         dataloader_pin_memory=False,
         report_to=None,
         save_total_limit=2,  # 只保存2个检查点以节省空间
     )
     
-    # 关键修改：直接使用数据加载器的数据集，但需要重新包装
-    # 因为Trainer期望的是Dataset对象，而不是DataLoader
+    #直接使用数据加载器的数据集，但需要重新包装
     
     # 创建自定义数据集包装器
     class DataLoaderDataset(torch.utils.data.Dataset):
@@ -254,30 +258,32 @@ def train_lora_gpt2(config):
     )
     
     # 开始训练
-    print("🎯 开始LoRA微调训练...")
-    print(f"⏰ 早停机制: 容忍 {config.early_stopping_patience} 次无改善评估")
+    print("  开始LoRA微调训练...")
+    print(f"  早停机制: 容忍 {config.early_stopping_patience} 次无改善评估")
+    if config.use_fp16 and torch.cuda.is_available():
+        print("  启用FP16混合精度训练")
     
     try:
         trainer.train()
         
         # 检查是否因早停而结束
         if early_stopping.early_stop:
-            print("🏁 训练因早停机制而结束")
+            print("  训练因早停机制而结束")
         else:
-            print("🏁 训练正常完成")
+            print("  训练正常完成")
             
     except KeyboardInterrupt:
-        print("⚠️ 训练被用户中断")
+        print("  训练被用户中断")
     except Exception as e:
-        print(f"❌ 训练出错: {e}")
+        print(f"  训练出错: {e}")
         raise
     
     # 保存最终模型
-    print("💾 保存最终模型...")
+    print("  保存最终模型...")
     trainer.save_model("./gpt2-lora-final")
     
     # 评估模型
-    print("📈 评估模型...")
+    print("  评估模型...")
     eval_results = trainer.evaluate()
     print(f"最终评估结果: {eval_results}")
     
@@ -291,7 +297,7 @@ def train_lora_gpt2_simple(config):
     print(f"使用设备: {device}")
     
     # 加载数据
-    print("📊 加载数据集...")
+    print("  加载数据集...")
     train_loader, val_loader, test_loader, tokenizer = get_dataloaders(config)
     
     # 设置模型
@@ -301,17 +307,22 @@ def train_lora_gpt2_simple(config):
     # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     
+    # 初始化GradScaler用于混合精度训练
+    scaler = GradScaler(enabled=config.use_fp16 and torch.cuda.is_available())
+    
     # 训练状态
     best_val_loss = float('inf')
     patience_counter = 0
     global_step = 0
     
-    print("🎯 开始LoRA微调训练...")
-    print(f"⏰ 早停机制: 容忍 {config.early_stopping_patience} 次无改善评估")
+    print("  开始LoRA微调训练...")
+    print(f"  早停机制: 容忍 {config.early_stopping_patience} 次无改善评估")
+    if config.use_fp16 and torch.cuda.is_available():
+        print("  启用FP16混合精度训练")
     
     # 计算总训练步数
     total_train_steps = len(train_loader) * config.num_epochs
-    print(f"📊 总训练步数: {total_train_steps}")
+    print(f"  总训练步数: {total_train_steps}")
     
     # 创建主进度条
     main_pbar = tqdm(total=total_train_steps, desc="总体训练进度", position=0)
@@ -333,13 +344,16 @@ def train_lora_gpt2_simple(config):
                 'labels': batch['labels'].to(device)
             }
             
-            # 前向传播
-            outputs = model(**inputs)
-            loss = outputs.loss
+            # 使用混合精度训练
+            with autocast(enabled=config.use_fp16 and torch.cuda.is_available()):
+                # 前向传播
+                outputs = model(**inputs)
+                loss = outputs.loss
             
             # 反向传播
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
             
             total_train_loss += loss.item()
@@ -358,7 +372,7 @@ def train_lora_gpt2_simple(config):
             # 记录日志
             if global_step % config.logging_steps == 0:
                 avg_loss = total_train_loss / train_steps
-                print(f"\n📝 Step {global_step}, Loss: {avg_loss:.4f}")
+                print(f"\n  Step {global_step}, Loss: {avg_loss:.4f}")
                 total_train_loss = 0
                 train_steps = 0
         
@@ -369,7 +383,7 @@ def train_lora_gpt2_simple(config):
         total_val_loss = 0
         val_steps = 0
         
-        print("🔍 验证中...")
+        print("  验证中...")
         # 创建验证进度条
         val_pbar = tqdm(total=len(val_loader), desc="验证进度", position=1, leave=False)
         
@@ -381,6 +395,7 @@ def train_lora_gpt2_simple(config):
                     'labels': batch['labels'].to(device)
                 }
                 
+                # 验证阶段不使用混合精度以保持精度
                 outputs = model(**inputs)
                 total_val_loss += outputs.loss.item()
                 val_steps += 1
@@ -390,7 +405,7 @@ def train_lora_gpt2_simple(config):
         val_pbar.close()
         
         avg_val_loss = total_val_loss / val_steps
-        print(f"📊 Epoch {epoch+1}, 验证损失: {avg_val_loss:.4f}")
+        print(f"  Epoch {epoch+1}, 验证损失: {avg_val_loss:.4f}")
         
         # 早停检查
         if avg_val_loss < best_val_loss - config.early_stopping_threshold:
@@ -399,13 +414,13 @@ def train_lora_gpt2_simple(config):
             # 保存最佳模型
             model.save_pretrained("./gpt2-lora-best")
             tokenizer.save_pretrained("./gpt2-lora-best")
-            print(f"🎯 保存最佳模型，验证损失: {avg_val_loss:.4f}")
+            print(f"  保存最佳模型，验证损失: {avg_val_loss:.4f}")
         else:
             patience_counter += 1
-            print(f"⏳ 早停计数: {patience_counter}/{config.early_stopping_patience}")
+            print(f"  早停计数: {patience_counter}/{config.early_stopping_patience}")
             
             if patience_counter >= config.early_stopping_patience:
-                print("🛑 触发早停机制!")
+                print("  触发早停机制!")
                 break
     
     # 关闭主进度条
@@ -416,14 +431,14 @@ def train_lora_gpt2_simple(config):
         model = GPT2LMHeadModel.from_pretrained("./gpt2-lora-best")
         model = get_peft_model(model, LoraConfig.from_pretrained("./gpt2-lora-best"))
         model = model.to(device)
-        print("💾 加载最佳模型完成")
+        print("  加载最佳模型完成")
     except:
-        print("⚠️ 无法加载最佳模型，使用当前模型")
+        print("  无法加载最佳模型，使用当前模型")
     
     # 保存最终模型
     model.save_pretrained("./gpt2-lora-final")
     tokenizer.save_pretrained("./gpt2-lora-final")
-    print("💾 保存最终模型完成")
+    print("  保存最终模型完成")
     
     return model, tokenizer
 
@@ -435,7 +450,7 @@ def train_lora_gpt2_with_tqdm(config):
     print(f"使用设备: {device}")
     
     # 加载数据
-    print("📊 加载数据集...")
+    print("  加载数据集...")
     train_loader, val_loader, test_loader, tokenizer = get_dataloaders(config)
     
     # 设置模型
@@ -448,6 +463,9 @@ def train_lora_gpt2_with_tqdm(config):
     # 学习率调度器
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * config.num_epochs)
     
+    # 初始化GradScaler用于混合精度训练
+    scaler = GradScaler(enabled=config.use_fp16 and torch.cuda.is_available())
+    
     # 训练状态
     best_val_loss = float('inf')
     patience_counter = 0
@@ -457,12 +475,14 @@ def train_lora_gpt2_with_tqdm(config):
     train_losses = []
     val_losses = []
     
-    print("🎯 开始LoRA微调训练...")
-    print(f"⏰ 早停机制: 容忍 {config.early_stopping_patience} 次无改善评估")
+    print("  开始LoRA微调训练...")
+    print(f"  早停机制: 容忍 {config.early_stopping_patience} 次无改善评估")
+    if config.use_fp16 and torch.cuda.is_available():
+        print("  启用FP16混合精度训练")
     
     # 计算总训练步数
     total_train_steps = len(train_loader) * config.num_epochs
-    print(f"📊 总训练步数: {total_train_steps}")
+    print(f"  总训练步数: {total_train_steps}")
     
     # 创建主进度条
     main_pbar = tqdm(total=total_train_steps, desc="总体训练进度", position=0)
@@ -484,13 +504,16 @@ def train_lora_gpt2_with_tqdm(config):
                 'labels': batch['labels'].to(device)
             }
             
-            # 前向传播
-            outputs = model(**inputs)
-            loss = outputs.loss
+            # 使用混合精度训练
+            with autocast(enabled=config.use_fp16 and torch.cuda.is_available()):
+                # 前向传播
+                outputs = model(**inputs)
+                loss = outputs.loss
             
             # 反向传播
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
             
@@ -509,7 +532,7 @@ def train_lora_gpt2_with_tqdm(config):
             
             # 记录日志
             if global_step % config.logging_steps == 0:
-                print(f"\n📝 Step {global_step}, Loss: {current_loss:.4f}, LR: {current_lr:.2e}")
+                print(f"\n  Step {global_step}, Loss: {current_loss:.4f}, LR: {current_lr:.2e}")
         
         epoch_pbar.close()
         avg_train_loss = epoch_train_loss / train_batches
@@ -520,7 +543,7 @@ def train_lora_gpt2_with_tqdm(config):
         epoch_val_loss = 0
         val_batches = 0
         
-        print("🔍 验证中...")
+        print("  验证中...")
         # 创建验证进度条
         val_pbar = tqdm(val_loader, desc="验证进度", position=1, leave=False)
         
@@ -532,6 +555,7 @@ def train_lora_gpt2_with_tqdm(config):
                     'labels': batch['labels'].to(device)
                 }
                 
+                # 验证阶段不使用混合精度以保持精度
                 outputs = model(**inputs)
                 epoch_val_loss += outputs.loss.item()
                 val_batches += 1
@@ -545,7 +569,7 @@ def train_lora_gpt2_with_tqdm(config):
         avg_val_loss = epoch_val_loss / val_batches
         val_losses.append(avg_val_loss)
         
-        print(f"📊 Epoch {epoch+1} 结果:")
+        print(f"  Epoch {epoch+1} 结果:")
         print(f"  训练损失: {avg_train_loss:.4f}")
         print(f"  验证损失: {avg_val_loss:.4f}")
         print(f"  学习率: {scheduler.get_last_lr()[0]:.2e}")
@@ -557,20 +581,20 @@ def train_lora_gpt2_with_tqdm(config):
             # 保存最佳模型
             model.save_pretrained("./gpt2-lora-best")
             tokenizer.save_pretrained("./gpt2-lora-best")
-            print(f"🎯 保存最佳模型，验证损失: {avg_val_loss:.4f}")
+            print(f"  保存最佳模型，验证损失: {avg_val_loss:.4f}")
         else:
             patience_counter += 1
-            print(f"⏳ 早停计数: {patience_counter}/{config.early_stopping_patience}")
+            print(f"  早停计数: {patience_counter}/{config.early_stopping_patience}")
             
             if patience_counter >= config.early_stopping_patience:
-                print("🛑 触发早停机制!")
+                print("  触发早停机制!")
                 break
     
     # 关闭主进度条
     main_pbar.close()
     
     # 打印训练总结
-    print("\n📈 训练总结:")
+    print("\n  训练总结:")
     print(f"  最佳验证损失: {best_val_loss:.4f}")
     print(f"  最终训练损失: {train_losses[-1]:.4f}")
     print(f"  训练轮次: {len(train_losses)}")
@@ -580,14 +604,14 @@ def train_lora_gpt2_with_tqdm(config):
         model = GPT2LMHeadModel.from_pretrained("./gpt2-lora-best")
         model = get_peft_model(model, LoraConfig.from_pretrained("./gpt2-lora-best"))
         model = model.to(device)
-        print("💾 加载最佳模型完成")
+        print("  加载最佳模型完成")
     except:
-        print("⚠️ 无法加载最佳模型，使用当前模型")
+        print("  无法加载最佳模型，使用当前模型")
     
     # 保存最终模型
     model.save_pretrained("./gpt2-lora-final")
     tokenizer.save_pretrained("./gpt2-lora-final")
-    print("💾 保存最终模型完成")
+    print("  保存最终模型完成")
     
     return model, tokenizer
 
@@ -645,7 +669,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     test_generation(model, tokenizer, device)
     
-    print("✅ LoRA微调完成！")
+    print("  LoRA微调完成！")
 
 if __name__ == "__main__":
     main()

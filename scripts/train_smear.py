@@ -75,10 +75,10 @@ def main():
     # SMEAR配置
     smear_config = SmearAdapterConfig(
         num_experts=4,
-        expert_size=512,
+        expert_size=256,
         router_temperature=1.0,
         routing_granularity="token",
-        segment_length=256,
+        segment_length=64,
         routing_strategy="top_k_sparse",
         top_k=2
     )

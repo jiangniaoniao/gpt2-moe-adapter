@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset, concatenate_datasets
 from transformers import GPT2Tokenizer
 import random
+import numpy as np
 
 def get_dataloaders(config):
     """支持多样化数据集混合的数据加载器"""
@@ -17,7 +18,7 @@ def get_dataloaders(config):
         return get_wikitext_dataloaders(config, tokenizer)
 
 def get_mixed_dataloaders(config, tokenizer):
-    """修复样本数量问题的混合数据集加载器"""
+    """修复样本数量问题和掩码处理的混合数据集加载器"""
     print("🚀 加载混合多样化数据集...")
     
     # 数据集配置
@@ -62,7 +63,7 @@ def get_mixed_dataloaders(config, tokenizer):
             
             print(f"    原始数据集大小: {len(train_data)}")
             
-            # 格式化数据集 - 使用新的处理函数
+            # 格式化数据集 - 使用修复后的处理函数
             formatted_dataset = format_and_process_dataset(
                 train_data, dataset_type, tokenizer, config
             )
@@ -166,6 +167,11 @@ def get_mixed_dataloaders(config, tokenizer):
     )
     
     print("🎉 混合数据加载器创建完成！")
+    
+    # 验证掩码处理
+    print("\n🔍 验证掩码处理...")
+    validate_mask_handling(train_loader, tokenizer, num_batches=1)
+    
     return train_loader, val_loader, test_loader, tokenizer
 
 def format_and_process_dataset(dataset, dataset_type, tokenizer, config):
@@ -285,26 +291,40 @@ def format_dataset_text(dataset, dataset_type):
             return dataset.map(lambda x: {"text": str(x)}).filter(lambda x: x['text'] and x['text'].strip())
 
 def process_dataset_with_padding(dataset, tokenizer, config):
-    """使用填充而不是分组来处理数据集 - 保持样本数量"""
+    """修复掩码问题的分词处理 - 保持样本数量"""
     
     def tokenize_function(examples):
         texts = [text for text in examples["text"] if text and text.strip()]
         
         if not texts:
-            return {"input_ids": [], "attention_mask": []}
+            return {"input_ids": [], "attention_mask": [], "labels": []}
         
         # 使用填充到最大长度
         tokenized = tokenizer(
             texts,
             truncation=True,
-            padding='max_length',  # 关键修改：使用填充而不是分组
+            padding='max_length',  # 使用填充
             max_length=config.max_length,
             return_tensors=None
         )
         
-        # 为语言建模设置labels
-        tokenized["labels"] = tokenized["input_ids"].copy()
+        # 🔧 关键修复：正确设置labels，忽略填充位置
+        labels = []
+        for i in range(len(tokenized["input_ids"])):
+            seq_input_ids = tokenized["input_ids"][i]
+            seq_attention_mask = tokenized["attention_mask"][i]
+            
+            # 复制input_ids作为labels的基础
+            seq_labels = seq_input_ids.copy()
+            
+            # 将填充位置的label设置为-100（被损失函数忽略）
+            for j in range(len(seq_attention_mask)):
+                if seq_attention_mask[j] == 0:
+                    seq_labels[j] = -100
+            
+            labels.append(seq_labels)
         
+        tokenized["labels"] = labels
         return tokenized
     
     # 分词处理
@@ -312,15 +332,72 @@ def process_dataset_with_padding(dataset, tokenizer, config):
         tokenize_function,
         batched=True,
         remove_columns=dataset.column_names,
-        desc="Tokenizing dataset with padding"
+        desc="Tokenizing dataset with correct mask handling"
     )
     
     # 过滤掉太短的序列（如果有的话）
     tokenized_dataset = tokenized_dataset.filter(
-        lambda x: len(x.get('input_ids', [])) > 10
+        lambda x: len(x.get('input_ids', [])) > 10 and 
+                 any(mask == 1 for mask in x.get('attention_mask', []))  # 至少有一个真实token
     )
     
     return tokenized_dataset
+
+def validate_mask_handling(dataloader, tokenizer, num_batches=2):
+    """验证掩码处理是否正确"""
+    print("🔍 验证掩码处理...")
+    
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= num_batches:
+            break
+            
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask'] 
+        labels = batch['labels']
+        
+        print(f"\n批次 {batch_idx}:")
+        print(f"  input_ids 形状: {input_ids.shape}")
+        print(f"  attention_mask 形状: {attention_mask.shape}")
+        print(f"  labels 形状: {labels.shape}")
+        
+        # 检查一个样本
+        sample_idx = 0
+        sample_input = input_ids[sample_idx]
+        sample_mask = attention_mask[sample_idx]
+        sample_labels = labels[sample_idx]
+        
+        print(f"\n  样本 {sample_idx} 分析:")
+        print(f"    input_ids (前20): {sample_input[:20].tolist()}")
+        print(f"    attention_mask (前20): {sample_mask[:20].tolist()}")
+        print(f"    labels (前20): {sample_labels[:20].tolist()}")
+        
+        # 验证：填充位置的label应该是-100
+        pad_positions = (sample_mask == 0).nonzero(as_tuple=True)[0]
+        if len(pad_positions) > 0:
+            pad_labels = sample_labels[pad_positions]
+            if all(label == -100 for label in pad_labels):
+                print("    ✅ 填充位置labels正确设置为-100")
+            else:
+                print(f"    ❌ 填充位置labels错误: {pad_labels}")
+                return False
+        else:
+            print("    ⚠️  该样本无填充位置")
+        
+        # 验证：非填充位置的label应该等于input_ids
+        non_pad_positions = (sample_mask == 1).nonzero(as_tuple=True)[0]
+        if len(non_pad_positions) > 0:
+            non_pad_inputs = sample_input[non_pad_positions]
+            non_pad_labels = sample_labels[non_pad_positions]
+            if torch.equal(non_pad_inputs, non_pad_labels):
+                print("    ✅ 非填充位置labels等于input_ids")
+            else:
+                print("    ❌ 非填充位置labels不等于input_ids")
+                return False
+        else:
+            print("    ⚠️  该样本无非填充位置")
+    
+    print("🎉 掩码处理验证通过！")
+    return True
 
 def format_dataset(dataset, dataset_type, tokenizer, config):
     """向后兼容的包装函数"""
@@ -338,9 +415,9 @@ def format_reasoning_data(dataset, tokenizer, config):
 def format_lm_data(dataset, tokenizer, config):
     return format_and_process_dataset(dataset, "lm", tokenizer, config)
 
-# 保留原有的WikiText数据加载器（保持不变）
+# 修复WikiText数据加载器
 def get_wikitext_dataloaders(config, tokenizer):
-    """WikiText数据加载器"""
+    """WikiText数据加载器 - 修复掩码处理"""
     print("  加载WikiText数据集...")
     
     dataset_config = getattr(config, 'dataset_config', 'wikitext-2-raw-v1')
@@ -362,16 +439,30 @@ def get_wikitext_dataloaders(config, tokenizer):
                 texts.append(text.strip())
         
         if not texts:
-            return {"input_ids": [], "attention_mask": []}
+            return {"input_ids": [], "attention_mask": [], "labels": []}
         
         tokenized = tokenizer(
             texts,
             truncation=True,
-            padding='max_length',  # 也改为填充
+            padding='max_length',
             max_length=config.max_length,
             return_tensors=None
         )
-        tokenized["labels"] = tokenized["input_ids"].copy()
+        
+        # 🔧 同样的修复应用于WikiText
+        labels = []
+        for i in range(len(tokenized["input_ids"])):
+            seq_input_ids = tokenized["input_ids"][i]
+            seq_attention_mask = tokenized["attention_mask"][i]
+            seq_labels = seq_input_ids.copy()
+            
+            for j in range(len(seq_attention_mask)):
+                if seq_attention_mask[j] == 0:
+                    seq_labels[j] = -100
+            
+            labels.append(seq_labels)
+        
+        tokenized["labels"] = labels
         return tokenized
     
     tokenized_train = train_dataset.map(
@@ -394,8 +485,6 @@ def get_wikitext_dataloaders(config, tokenizer):
         remove_columns=test_dataset.column_names,
         desc="Tokenizing WikiText test set"
     )
-    
-    # 移除分组步骤，直接使用填充后的数据
     
     def wikitext_collate_fn(batch):
         valid_batch = [item for item in batch if len(item['input_ids']) > 0]
@@ -435,4 +524,9 @@ def get_wikitext_dataloaders(config, tokenizer):
     )
     
     print("  WikiText数据加载器创建完成")
+    
+    # 验证掩码处理
+    print("  验证WikiText掩码处理...")
+    validate_mask_handling(train_loader, tokenizer, num_batches=1)
+    
     return train_loader, val_loader, test_loader, tokenizer
