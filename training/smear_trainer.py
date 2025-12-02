@@ -6,11 +6,9 @@ from tqdm import tqdm
 import os
 import json
 import numpy as np
-from torch.cuda.amp import autocast, GradScaler
-
 
 class SmearTrainer:
-    """SMEAR训练器 - 修复早停机制 + FP16支持"""
+    """SMEAR训练器 - 修复早停机制"""
     
     def __init__(self, model, train_loader, val_loader, test_loader, config):
         self.model = model
@@ -18,10 +16,6 @@ class SmearTrainer:
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.config = config
-        
-        # FP16配置
-        self.use_fp16 = getattr(config, 'use_fp16', True)  # 默认为True
-        self.scaler = GradScaler() if self.use_fp16 and torch.cuda.is_available() else None
         
         # 优化器 - 只训练Adapter参数
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -46,25 +40,24 @@ class SmearTrainer:
             'test_perplexity': None,
             'best_val_loss': float('inf'),
             'best_epoch': -1,
-            'early_stop_epoch': None,
-            'fp16_enabled': self.use_fp16 and self.scaler is not None  # 记录FP16状态
+            'early_stop_epoch': None
         }
         
         # 早停相关变量
-        self.patience = getattr(config, 'patience', 3)
+        self.patience = getattr(config, 'patience', 3)  # 默认容忍3个epoch没有改善
         self.patience_counter = 0
-        self.min_delta = getattr(config, 'min_delta', 1e-4)
+        self.min_delta = getattr(config, 'min_delta', 1e-4)  # 最小改善阈值
         
-        print(f"  初始化SMEAR训练器")
+        print(f"🚀 初始化SMEAR训练器")
         print(f"   - 设备: {self.device}")
-        print(f"   - FP16: {'启用' if self.train_stats['fp16_enabled'] else '禁用'}")
         print(f"   - 可训练参数: {sum(p.numel() for p in trainable_params):,}")
         print(f"   - 早停耐心值: {self.patience} epochs")
-        if self.train_stats['fp16_enabled']:
-            print(f"   - 使用混合精度训练 (FP16)")
-
+        print(f"   - 最小改善阈值: {self.min_delta}")
+        if test_loader is not None:
+            print(f"   - 测试集大小: {len(test_loader.dataset)} 样本")
+    
     def train_epoch(self, epoch):
-        """训练一个epoch - 支持FP16"""
+        """训练一个epoch"""
         self.model.train()
         total_loss = 0
         
@@ -76,53 +69,32 @@ class SmearTrainer:
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            # FP16前向传播
-            if self.use_fp16 and self.scaler is not None:
-                with autocast():
-                    outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs['loss']
-                
-                # FP16反向传播和梯度缩放
-                self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-                
-                # 梯度裁剪（在缩放后的梯度上）
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                
-                # 优化器步骤和缩放器更新
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
-            else:
-                # 普通FP32训练
-                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs['loss']
-                
-                # 反向传播
-                self.optimizer.zero_grad()
-                loss.backward()
-                
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
+            # 前向传播
+            outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs['loss']
             
-            # 学习率调度（两种模式都需要）
+            # 反向传播
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            
+            self.optimizer.step()
             self.scheduler.step()
             
-            # 记录损失
+            # 只记录核心损失
             total_loss += loss.item()
             
-            # 进度条更新
+            # 简化的进度条 - 只显示核心指标
             current_lr = self.scheduler.get_last_lr()[0]
             progress_bar.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'LR': f'{current_lr:.2e}',
-                'Patience': f'{self.patience_counter}/{self.patience}',
-                'FP16': 'ON' if self.use_fp16 else 'OFF'
+                'Patience': f'{self.patience_counter}/{self.patience}'
             })
             
-            # 定期记录学习率
+            # 每100个batch记录一次学习率（可选）
             if batch_idx % 100 == 0:
                 self.train_stats['learning_rates'].append(current_lr)
         
@@ -131,9 +103,9 @@ class SmearTrainer:
         self.train_stats['losses'].append(avg_loss)
         
         return avg_loss
-
+    
     def validate(self, epoch):
-        """验证 - 支持FP16"""
+        """验证"""
         self.model.eval()
         total_loss = 0
         total_perplexity = 0
@@ -144,15 +116,8 @@ class SmearTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                # 验证时也使用FP16以减少内存占用
-                if self.use_fp16:
-                    with autocast():
-                        outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                        loss = outputs['loss']
-                else:
-                    outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs['loss']
-                
+                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss']
                 total_loss += loss.item()
                 
                 # 计算困惑度
@@ -165,23 +130,23 @@ class SmearTrainer:
         self.train_stats['perplexities'].append(avg_perplexity)
         
         return avg_loss, avg_perplexity
-
+    
     def test(self, model_path=None):
-        """在测试集上评估模型 - 支持FP16"""
+        """在测试集上评估模型"""
         if self.test_loader is None:
-            print("   未提供测试集，跳过测试评估")
+            print("⚠️  未提供测试集，跳过测试评估")
             return None, None
         
         # 如果指定了模型路径，则重新加载完整模型
         if model_path is not None:
             self.load_complete_model(model_path)
-            print(f"  加载完整模型进行测试: {model_path}")
+            print(f"📂 加载完整模型进行测试: {model_path}")
         
         self.model.eval()
         total_loss = 0
         total_perplexity = 0
         
-        print("  开始在测试集上评估...")
+        print("🧪 开始在测试集上评估...")
         
         with torch.no_grad():
             for batch in tqdm(self.test_loader, desc='Testing'):
@@ -189,15 +154,8 @@ class SmearTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                # 测试时使用FP16
-                if self.use_fp16:
-                    with autocast():
-                        outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                        loss = outputs['loss']
-                else:
-                    outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs['loss']
-                
+                outputs = self.model(input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs['loss']
                 total_loss += loss.item()
                 
                 # 计算困惑度
@@ -211,12 +169,12 @@ class SmearTrainer:
         self.train_stats['test_loss'] = avg_loss
         self.train_stats['test_perplexity'] = avg_perplexity
         
-        print(f"  测试集结果:")
+        print(f"🎯 测试集结果:")
         print(f"  - 测试损失: {avg_loss:.4f}")
         print(f"  - 测试困惑度: {avg_perplexity:.4f}")
         
         return avg_loss, avg_perplexity
-
+    
     def save_complete_model(self, path):
         """保存完整模型（基础模型 + SMEAR适配器）"""
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -228,12 +186,11 @@ class SmearTrainer:
             'model_state_dict': self.model.state_dict(),
             'config': self.config.__dict__,
             'training_stats': self.train_stats,
-            'smear_adapters_only': False,
-            'fp16_enabled': self.use_fp16  # 保存FP16状态
+            'smear_adapters_only': False  # 标记这是完整模型
         }
         
         torch.save(complete_state_dict, os.path.join(save_path, 'complete_model.pth'))
-        print(f"  保存完整模型到 {save_path}")
+        print(f"💾 保存完整模型到 {save_path}")
     
     def save_smear_adapters_only(self, path):
         """仅保存SMEAR适配器参数（用于继续训练）"""
@@ -263,8 +220,8 @@ class SmearTrainer:
         checkpoint_path = os.path.join(model_path, 'complete_model.pth')
         
         if not os.path.exists(checkpoint_path):
-            print(f"  完整模型文件不存在: {checkpoint_path}")
-            print("   尝试加载仅适配器版本...")
+            print(f"❌ 完整模型文件不存在: {checkpoint_path}")
+            print("⚠️  尝试加载仅适配器版本...")
             return self.load_smear_adapters_only(model_path)
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -276,7 +233,7 @@ class SmearTrainer:
         if 'training_stats' in checkpoint:
             self.train_stats.update(checkpoint['training_stats'])
         
-        print(f"  从 {model_path} 加载完整模型")
+        print(f"📥 从 {model_path} 加载完整模型")
         return True
     
     def load_smear_adapters_only(self, model_path):
@@ -284,7 +241,7 @@ class SmearTrainer:
         checkpoint_path = os.path.join(model_path, 'smear_adapters.pth')
         
         if not os.path.exists(checkpoint_path):
-            print(f"  适配器文件不存在: {checkpoint_path}")
+            print(f"❌ 适配器文件不存在: {checkpoint_path}")
             return False
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -298,7 +255,7 @@ class SmearTrainer:
             if name in model_state_dict:
                 model_state_dict[name].copy_(param)
             else:
-                print(f"   跳过不匹配的参数: {name}")
+                print(f"⚠️  跳过不匹配的参数: {name}")
         
         # 加载更新后的状态字典
         self.model.load_state_dict(model_state_dict)
@@ -307,7 +264,7 @@ class SmearTrainer:
         if 'training_stats' in checkpoint:
             self.train_stats.update(checkpoint['training_stats'])
         
-        print(f"  从 {model_path} 加载SMEAR适配器参数")
+        print(f"📥 从 {model_path} 加载SMEAR适配器参数")
         return True
     
     def check_early_stop(self, current_val_loss, best_val_loss, epoch):
@@ -318,30 +275,30 @@ class SmearTrainer:
         if improvement > self.min_delta:
             # 有显著改善，重置计数器
             self.patience_counter = 0
-            print(f"  验证损失改善: {improvement:.6f} > {self.min_delta}")
+            print(f"✅ 验证损失改善: {improvement:.6f} > {self.min_delta}")
             return False
         else:
             # 没有显著改善，增加计数器
             self.patience_counter += 1
-            print(f"  验证损失未改善，耐心计数: {self.patience_counter}/{self.patience}")
+            print(f"⏳ 验证损失未改善，耐心计数: {self.patience_counter}/{self.patience}")
             
             # 检查是否达到耐心限制
             if self.patience_counter >= self.patience:
-                print(f"  早停触发！连续 {self.patience} 个epoch验证损失未改善")
+                print(f"🛑 早停触发！连续 {self.patience} 个epoch验证损失未改善")
                 self.train_stats['early_stop_epoch'] = epoch
                 return True
             
             return False
     
     def train(self):
-        """完整训练流程 - 早停机制"""
+        """完整训练流程 - 修复早停机制"""
         best_val_loss = float('inf')
         best_epoch = -1
         
-        print(" 开始训练")
+        print("🚀 开始训练SMEAR适配器模型")
         
         for epoch in range(self.config.num_epochs):
-            print(f"\n  Epoch {epoch + 1}/{self.config.num_epochs}")
+            print(f"\n📍 Epoch {epoch + 1}/{self.config.num_epochs}")
             
             # 训练
             train_loss = self.train_epoch(epoch)
@@ -350,7 +307,7 @@ class SmearTrainer:
             val_loss, val_perplexity = self.validate(epoch)
             
             # 简化的训练统计输出
-            print(f"  训练统计:")
+            print(f"📈 训练统计:")
             print(f"  - 训练损失: {train_loss:.4f}")
             print(f"  - 验证损失: {val_loss:.4f}")
             print(f"  - 验证困惑度: {val_perplexity:.4f}")
@@ -370,13 +327,13 @@ class SmearTrainer:
                 
                 self.train_stats['best_val_loss'] = best_val_loss
                 self.train_stats['best_epoch'] = best_epoch
-                print(f"  保存最佳模型 (验证损失: {val_loss:.4f}, Epoch: {epoch})")
+                print(f"💾 保存最佳模型 (验证损失: {val_loss:.4f}, Epoch: {epoch})")
             else:
-                print(f"  验证损失未改善，跳过保存 (当前最佳: {best_val_loss:.4f})")
+                print(f"📉 验证损失未改善，跳过保存 (当前最佳: {best_val_loss:.4f})")
             
             # 检查早停条件 - 只在没有改善时检查
             if not has_improvement and self.check_early_stop(val_loss, best_val_loss, epoch):
-                print(f"   训练在 Epoch {epoch} 提前停止")
+                print(f"⏹️  训练在 Epoch {epoch} 提前停止")
                 break
             
             # 保存训练统计
@@ -384,110 +341,27 @@ class SmearTrainer:
         
         # 训练结束后在测试集上评估最佳模型
         print(f"\n{'='*50}")
-        print("  训练完成，开始在测试集上评估最佳模型...")
+        print("🎯 训练完成，开始在测试集上评估最佳模型...")
         print(f"{'='*50}")
         
         test_loss, test_perplexity = self.test("best_smear_model")
         
         # 最终报告
         print(f"\n{'='*50}")
-        print("  最终训练报告:")
+        print("🏁 最终训练报告:")
         print(f"{'='*50}")
-        print(f"  最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
-        print(f"  最终训练轮数: {len(self.train_stats['losses'])}")
+        print(f"📊 最佳验证损失: {best_val_loss:.4f} (Epoch {best_epoch})")
+        print(f"📊 最终训练轮数: {len(self.train_stats['losses'])}")
         if self.train_stats['early_stop_epoch'] is not None:
-            print(f"   早停触发于: Epoch {self.train_stats['early_stop_epoch']}")
+            print(f"⏹️  早停触发于: Epoch {self.train_stats['early_stop_epoch']}")
         if test_loss is not None:
-            print(f"  测试集损失: {test_loss:.4f}")
-            print(f"  测试集困惑度: {test_perplexity:.4f}")
-        
-        # 基础功能测试
-        print(f"\n{'='*50}")
-        print("  开始模型基础功能测试...")
-        print(f"{'='*50}")
-        self.run_basic_generation_test()
+            print(f"🎯 测试集损失: {test_loss:.4f}")
+            print(f"🎯 测试集困惑度: {test_perplexity:.4f}")
         
         # 保存最终报告
         self.save_final_report(best_val_loss, best_epoch, test_loss, test_perplexity)
         
         return best_val_loss
-    
-
-    
-    def run_basic_generation_test(self):
-        """运行模型基础功能测试"""
-        try:
-            print("  正在测试模型基础生成功能...")
-            
-            # 创建tokenizer
-            from transformers import GPT2Tokenizer
-            tokenizer = GPT2Tokenizer.from_pretrained("/home/yang/gpt2-moe-adapter/gpt2")
-            tokenizer.pad_token = tokenizer.eos_token
-            
-            # 测试用例
-            test_prompts = [
-                "The future of artificial intelligence is",
-                "In a world where technology advances rapidly,",
-                "Machine learning has revolutionized"
-            ]
-            
-            self.model.eval()
-            
-            print(f"  设备: {self.device}")
-            print(f"  FP16: {'启用' if self.use_fp16 else '禁用'}")
-            
-            with torch.no_grad():
-                for i, prompt in enumerate(test_prompts):
-                    print(f"\n  --- 测试样本 {i+1} ---")
-                    print(f"  输入提示: {prompt}")
-                    
-                    try:
-                        # 分词
-                        inputs = tokenizer(
-                            prompt,
-                            return_tensors="pt",
-                            truncation=True,
-                            max_length=128
-                        ).to(self.device)
-                        
-                        print(f"  输入长度: {inputs.input_ids.shape[1]} tokens")
-                        
-                        # 生成文本
-                        if self.use_fp16:
-                            with autocast():
-                                outputs = self.model.generate(
-                                    inputs.input_ids,
-                                    max_new_tokens=50,
-                                    do_sample=False,
-                                    pad_token_id=tokenizer.eos_token_id,
-                                    num_return_sequences=1
-                                )
-                        else:
-                            outputs = self.model.generate(
-                                inputs.input_ids,
-                                max_new_tokens=50,
-                                do_sample=False,
-                                pad_token_id=tokenizer.eos_token_id,
-                                num_return_sequences=1
-                            )
-                        
-                        # 解码结果
-                        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                        prediction = generated_text[len(prompt):].strip()
-                        
-                        print(f"  生成结果: {prediction}")
-                        print(f"  生成状态: ✓ 成功")
-                        
-                    except Exception as e:
-                        print(f"  生成状态: ✗ 失败 - {e}")
-                        return False
-            
-            print(f"\n  ✅ 基础功能测试完成 - 所有测试通过")
-            return True
-            
-        except Exception as e:
-            print(f"  ❌ 基础功能测试失败: {e}")
-            return False
     
     def save_training_stats(self):
         """保存训练统计"""
@@ -523,5 +397,4 @@ class SmearTrainer:
         with open(report_path, 'w') as f:
             json.dump(report, f, indent=2)
         
-        print(f"  最终报告已保存到: {report_path}")
-
+        print(f"📄 最终报告已保存到: {report_path}")
